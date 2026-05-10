@@ -29,6 +29,7 @@ export const DEFAULT_PRODUCTIVITY_REVIEW_MAX_CREATIONS_PER_WINDOW = 3;
 
 const TERMINAL_RUN_STATUSES = ["succeeded", "failed", "cancelled", "timed_out"] as const;
 const ACTIVE_RUN_STATUSES = ["queued", "running", "scheduled_retry"] as const;
+const PRODUCTIVITY_REVIEW_ELIGIBLE_SOURCE_PRIORITIES = ["critical", "high"] as const;
 const MAX_CANDIDATE_ISSUES = 250;
 const MAX_RUNS_FOR_STREAK = 100;
 const MAX_PARENT_WALK_DEPTH = 25;
@@ -769,6 +770,7 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
           isNull(issues.hiddenAt),
           isNull(issues.assigneeUserId),
           inArray(issues.status, ["todo", "in_progress"]),
+          inArray(issues.priority, PRODUCTIVITY_REVIEW_ELIGIBLE_SOURCE_PRIORITIES),
           sql`${issues.assigneeAgentId} is not null`,
           sql`${issues.originKind} <> ${PRODUCTIVITY_REVIEW_ORIGIN_KIND}`,
         ),

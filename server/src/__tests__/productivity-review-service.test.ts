@@ -52,6 +52,7 @@ describeEmbeddedPostgres("productivity review service", () => {
 
   async function seedAssignedIssue(opts?: {
     status?: "todo" | "in_progress";
+    priority?: "critical" | "high" | "medium" | "low";
     startedAt?: Date;
     parentId?: string | null;
     originKind?: string;
@@ -99,7 +100,7 @@ describeEmbeddedPostgres("productivity review service", () => {
       companyId,
       title: "Implement data import",
       status: opts?.status ?? "in_progress",
-      priority: "medium",
+      priority: opts?.priority ?? "high",
       assigneeAgentId: coderId,
       parentId: opts?.parentId ?? null,
       originKind: opts?.originKind ?? "manual",
@@ -207,6 +208,53 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(reviews[0]?.description).toContain("No-comment completed-run streak: 10");
 
     expect(await listRefreshComments(reviews[0]!.id)).toHaveLength(0);
+  });
+
+  it("skips medium and low priority source issues while still reviewing high priority work", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const medium = await seedAssignedIssue({ priority: "medium" });
+    await insertRuns({
+      companyId: medium.companyId,
+      agentId: medium.coderId,
+      issueId: medium.issueId,
+      count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+      now,
+    });
+
+    const low = await seedAssignedIssue({ priority: "low" });
+    await insertRuns({
+      companyId: low.companyId,
+      agentId: low.coderId,
+      issueId: low.issueId,
+      count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+      now,
+    });
+
+    const high = await seedAssignedIssue({ priority: "high" });
+    await insertRuns({
+      companyId: high.companyId,
+      agentId: high.coderId,
+      issueId: high.issueId,
+      count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+      now,
+    });
+
+    const service = productivityReviewService(db);
+
+    expect(await service.reconcileProductivityReviews({ now, companyId: medium.companyId })).toMatchObject({
+      scanned: 0,
+      created: 0,
+    });
+    expect(await service.reconcileProductivityReviews({ now, companyId: low.companyId })).toMatchObject({
+      scanned: 0,
+      created: 0,
+    });
+
+    const highResult = await service.reconcileProductivityReviews({ now, companyId: high.companyId });
+    expect(highResult.created).toBe(1);
+    const highReviews = await listProductivityReviews(high.companyId);
+    expect(highReviews).toHaveLength(1);
+    expect(highReviews[0]?.originId).toBe(high.issueId);
   });
 
   it("refreshes open productivity reviews only once per interval and caps refresh comments", async () => {
