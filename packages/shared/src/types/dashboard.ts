@@ -32,5 +32,16 @@ export interface DashboardSummary {
     pausedAgents: number;
     pausedProjects: number;
   };
+  heartbeatRunStaleness?: {
+    thresholdMs: number;
+    staleAgentCount: number;
+    totalStaleRunCount: number;
+    agents: Array<{
+      agentId: string;
+      agentName: string;
+      lastHeartbeatAt: Date | string | null;
+      staleRunCount: number;
+    }>;
+  };
   runActivity: DashboardRunActivityDay[];
 }
