@@ -20,6 +20,29 @@ export interface HeartbeatRunTimeoutPolicy {
 export interface HeartbeatRunStopMetadata extends HeartbeatRunTimeoutPolicy {
   stopReason: HeartbeatRunStopReason;
   timeoutFired: boolean;
+  adapterFailureKind?: "transient_spawn" | "terminal" | null;
+  adapterSpawnErrorCode?: string | null;
+}
+
+const TRANSIENT_ADAPTER_SPAWN_ERROR_CODES = new Set(["EAGAIN", "ENOMEM", "ETXTBSY", "EMFILE", "ENFILE"]);
+
+function readNonEmptyString(value: unknown): string | null {
+  return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
+}
+
+export function isTransientAdapterSpawnErrorCode(value: unknown): value is string {
+  const code = readNonEmptyString(value);
+  return code ? TRANSIENT_ADAPTER_SPAWN_ERROR_CODES.has(code) : false;
+}
+
+export function classifyAdapterFailureKind(input: {
+  outcome: HeartbeatRunOutcome;
+  errorCode?: string | null;
+  adapterSpawnErrorCode?: string | null;
+}): "transient_spawn" | "terminal" | null {
+  if (input.outcome !== "failed") return null;
+  if (input.errorCode !== "adapter_failed") return null;
+  return isTransientAdapterSpawnErrorCode(input.adapterSpawnErrorCode) ? "transient_spawn" : "terminal";
 }
 
 function readFiniteNumber(value: unknown): number | null {
@@ -102,13 +125,18 @@ export function buildHeartbeatRunStopMetadata(input: {
   outcome: HeartbeatRunOutcome;
   errorCode?: string | null;
   errorMessage?: string | null;
+  adapterSpawnErrorCode?: string | null;
 }): HeartbeatRunStopMetadata {
   const timeoutPolicy = resolveHeartbeatRunTimeoutPolicy(input.adapterType, input.adapterConfig);
   const stopReason = inferHeartbeatRunStopReason(input);
+  const adapterFailureKind = classifyAdapterFailureKind(input);
+  const adapterSpawnErrorCode = readNonEmptyString(input.adapterSpawnErrorCode);
   return {
     ...timeoutPolicy,
     stopReason,
     timeoutFired: stopReason === "timeout",
+    ...(adapterFailureKind ? { adapterFailureKind } : {}),
+    ...(adapterSpawnErrorCode ? { adapterSpawnErrorCode } : {}),
   };
 }
 
@@ -124,6 +152,8 @@ export function mergeHeartbeatRunStopMetadata(
     timeoutConfigured: metadata.timeoutConfigured,
     timeoutSource: metadata.timeoutSource,
     timeoutFired: metadata.timeoutFired,
+    ...(metadata.adapterFailureKind ? { adapterFailureKind: metadata.adapterFailureKind } : {}),
+    ...(metadata.adapterSpawnErrorCode ? { adapterSpawnErrorCode: metadata.adapterSpawnErrorCode } : {}),
     ...(metadata.effectiveTimeoutMs != null ? { effectiveTimeoutMs: metadata.effectiveTimeoutMs } : {}),
   };
 }

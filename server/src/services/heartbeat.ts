@@ -72,6 +72,7 @@ import {
 } from "./heartbeat-run-summary.js";
 import {
   buildHeartbeatRunStopMetadata,
+  isTransientAdapterSpawnErrorCode,
   mergeHeartbeatRunStopMetadata,
   normalizeMaxTurnStopReason,
 } from "./heartbeat-stop-metadata.js";
@@ -194,6 +195,8 @@ const WAKE_COMMENT_IDS_KEY = "wakeCommentIds";
 const PAPERCLIP_WAKE_PAYLOAD_KEY = "paperclipWake";
 const PAPERCLIP_HARNESS_CHECKOUT_KEY = "paperclipHarnessCheckedOut";
 const DETACHED_PROCESS_ERROR_CODE = "process_detached";
+const DETACHED_PROCESS_RECOVERED_ERROR_CODE = "process_detached_recovered";
+const DETACHED_PROCESS_RECOVERY_THRESHOLD_MS = 10 * 60 * 1000;
 const REPO_ONLY_CWD_SENTINEL = "/__paperclip_repo_only__";
 const MANAGED_WORKSPACE_GIT_CLONE_TIMEOUT_MS = 10 * 60 * 1000;
 const MAX_INLINE_WAKE_COMMENTS = 8;
@@ -220,6 +223,13 @@ const BOUNDED_TRANSIENT_HEARTBEAT_RETRY_JITTER_RATIO = 0.25;
 const BOUNDED_TRANSIENT_HEARTBEAT_RETRY_REASON = "transient_failure";
 const BOUNDED_TRANSIENT_HEARTBEAT_RETRY_WAKE_REASON = "transient_failure_retry";
 const BOUNDED_TRANSIENT_HEARTBEAT_RETRY_MAX_ATTEMPTS = BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS.length;
+export const TRANSIENT_ADAPTER_SPAWN_RETRY_DELAYS_MS = [
+  60 * 1000,
+  5 * 60 * 1000,
+  15 * 60 * 1000,
+] as const;
+export const TRANSIENT_ADAPTER_SPAWN_RETRY_REASON = "transient_adapter_spawn_failure";
+export const TRANSIENT_ADAPTER_SPAWN_RETRY_WAKE_REASON = "transient_adapter_spawn_retry";
 export const MAX_TURN_CONTINUATION_RETRY_REASON = "max_turns_continuation";
 export const MAX_TURN_CONTINUATION_WAKE_REASON = "max_turns_continuation_retry";
 const MAX_TURN_CONTINUATION_DEFAULT_MAX_ATTEMPTS = 2;
@@ -252,6 +262,13 @@ function readHeartbeatRunErrorFamily(
   const resultJson = parseObject(run.resultJson);
   const persistedFamily = readNonEmptyString(resultJson.errorFamily);
   if (persistedFamily) return persistedFamily;
+  if (
+    run.errorCode === "adapter_failed" &&
+    resultJson.adapterSpawnFailureTransient === true &&
+    isTransientAdapterSpawnErrorCode(resultJson.adapterSpawnErrorCode)
+  ) {
+    return "transient_adapter_spawn";
+  }
 
   if (run.errorCode === "codex_transient_upstream" || run.errorCode === "claude_transient_upstream") {
     return "transient_upstream";
@@ -282,12 +299,20 @@ function readTransientRetryNotBeforeFromRun(run: Pick<typeof heartbeatRuns.$infe
 function readTransientRecoveryContractFromRun(
   run: Pick<typeof heartbeatRuns.$inferSelect, "errorCode" | "resultJson">,
 ) {
-  return readHeartbeatRunErrorFamily(run) === "transient_upstream"
-    ? {
-        errorFamily: "transient_upstream" as const,
-        retryNotBefore: readTransientRetryNotBeforeFromRun(run),
-      }
-    : null;
+  const errorFamily = readHeartbeatRunErrorFamily(run);
+  if (errorFamily === "transient_upstream") {
+    return {
+      errorFamily: "transient_upstream" as const,
+      retryNotBefore: readTransientRetryNotBeforeFromRun(run),
+    };
+  }
+  if (errorFamily === "transient_adapter_spawn") {
+    return {
+      errorFamily: "transient_adapter_spawn" as const,
+      retryNotBefore: readTransientRetryNotBeforeFromRun(run),
+    };
+  }
+  return null;
 }
 
 function mergeAdapterRecoveryMetadata(input: {
@@ -433,6 +458,19 @@ export function computeBoundedTransientHeartbeatRetrySchedule(
     delayMs,
     dueAt: new Date(now.getTime() + delayMs),
     maxAttempts: BOUNDED_TRANSIENT_HEARTBEAT_RETRY_MAX_ATTEMPTS,
+  };
+}
+
+function computeTransientAdapterSpawnRetrySchedule(attempt: number, now = new Date()) {
+  if (!Number.isInteger(attempt) || attempt <= 0) return null;
+  const delayMs = TRANSIENT_ADAPTER_SPAWN_RETRY_DELAYS_MS[attempt - 1];
+  if (typeof delayMs !== "number") return null;
+  return {
+    attempt,
+    baseDelayMs: delayMs,
+    delayMs,
+    dueAt: new Date(now.getTime() + delayMs),
+    maxAttempts: TRANSIENT_ADAPTER_SPAWN_RETRY_DELAYS_MS.length,
   };
 }
 
@@ -1255,6 +1293,16 @@ function summarizeRunFailureForIssueComment(
   if (errorCode) return ` Latest retry failure: \`${errorCode}\`.`;
   if (summary) return ` Latest retry failure: ${summary}.`;
   return null;
+}
+
+function readAdapterSpawnErrorCode(input: {
+  resultJson?: Record<string, unknown> | null;
+  error?: unknown;
+}) {
+  const resultCode = readNonEmptyString(input.resultJson?.adapterSpawnErrorCode);
+  if (resultCode) return resultCode;
+  const errorCode = (input.error as { code?: unknown } | null)?.code;
+  return readNonEmptyString(errorCode);
 }
 
 function didAutomaticRecoveryFail(
@@ -2207,6 +2255,29 @@ function buildProcessLossMessage(run: {
     return `Process lost -- process group ${run.processGroupId} is no longer running`;
   }
   return "Process lost -- server may have restarted";
+}
+
+function outputSilenceAgeMsForRun(
+  run: Pick<typeof heartbeatRuns.$inferSelect, "lastOutputAt" | "processStartedAt" | "startedAt" | "createdAt">,
+  now: Date,
+) {
+  const ref = run.lastOutputAt ?? run.processStartedAt ?? run.startedAt ?? run.createdAt ?? null;
+  if (!ref) return null;
+  return Math.max(0, now.getTime() - new Date(ref).getTime());
+}
+
+function detachedProcessAgeMsForRun(
+  run: Pick<
+    typeof heartbeatRuns.$inferSelect,
+    "errorCode" | "updatedAt" | "processStartedAt" | "startedAt" | "createdAt"
+  >,
+  now: Date,
+) {
+  const ref = run.errorCode === DETACHED_PROCESS_ERROR_CODE
+    ? run.updatedAt ?? run.processStartedAt ?? run.startedAt ?? run.createdAt ?? null
+    : null;
+  if (!ref) return null;
+  return Math.max(0, now.getTime() - new Date(ref).getTime());
 }
 
 function truncateDisplayId(value: string | null | undefined, max = 128) {
@@ -4997,6 +5068,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       },
     });
 
+    await finalizeAgentStatus(cancelled.agentId, "cancelled");
+
     return cancelled;
   }
 
@@ -5119,8 +5192,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   ) {
     const now = opts?.now ?? new Date();
     const retryReason = opts?.retryReason ?? BOUNDED_TRANSIENT_HEARTBEAT_RETRY_REASON;
-    const wakeReason = opts?.wakeReason ?? BOUNDED_TRANSIENT_HEARTBEAT_RETRY_WAKE_REASON;
-    const maxAttempts = Math.max(0, Math.floor(opts?.maxAttempts ?? BOUNDED_TRANSIENT_HEARTBEAT_RETRY_MAX_ATTEMPTS));
+    const wakeReason =
+      opts?.wakeReason ??
+      (retryReason === TRANSIENT_ADAPTER_SPAWN_RETRY_REASON
+        ? TRANSIENT_ADAPTER_SPAWN_RETRY_WAKE_REASON
+        : BOUNDED_TRANSIENT_HEARTBEAT_RETRY_WAKE_REASON);
+    const defaultMaxAttempts =
+      retryReason === TRANSIENT_ADAPTER_SPAWN_RETRY_REASON
+        ? TRANSIENT_ADAPTER_SPAWN_RETRY_DELAYS_MS.length
+        : BOUNDED_TRANSIENT_HEARTBEAT_RETRY_MAX_ATTEMPTS;
+    const maxAttempts = Math.max(0, Math.floor(opts?.maxAttempts ?? defaultMaxAttempts));
     const nextAttempt = (run.scheduledRetryAttempt ?? 0) + 1;
     const baseSchedule = opts?.delayMs != null
       ? nextAttempt <= maxAttempts
@@ -5132,11 +5213,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             maxAttempts,
           }
         : null
+      : retryReason === TRANSIENT_ADAPTER_SPAWN_RETRY_REASON
+        ? nextAttempt <= maxAttempts
+          ? computeTransientAdapterSpawnRetrySchedule(nextAttempt, now)
+          : null
       : nextAttempt <= maxAttempts
         ? computeBoundedTransientHeartbeatRetrySchedule(nextAttempt, now, opts?.random)
         : null;
     const transientRecovery =
-      retryReason === BOUNDED_TRANSIENT_HEARTBEAT_RETRY_REASON
+      retryReason === BOUNDED_TRANSIENT_HEARTBEAT_RETRY_REASON ||
+      retryReason === TRANSIENT_ADAPTER_SPAWN_RETRY_REASON
         ? readTransientRecoveryContractFromRun(run)
         : null;
     const codexTransientFallbackMode =
@@ -5503,6 +5589,28 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         ...(codexTransientFallbackMode ? { codexTransientFallbackMode } : {}),
       },
     });
+
+    if (issueId && retryReason === TRANSIENT_ADAPTER_SPAWN_RETRY_REASON && !scheduleResult.reusedExisting) {
+      const resultJson = parseObject(run.resultJson);
+      const spawnCode = readNonEmptyString(resultJson.adapterSpawnErrorCode);
+      await issuesSvc.addComment(
+        issueId,
+        [
+          "Scheduled automatic retry for transient adapter spawn failure.",
+          "",
+          `- Retry attempt: ${schedule.attempt}/${schedule.maxAttempts}`,
+          `- Retry reason: \`${retryReason}\``,
+          `- Backoff: ${Math.round(schedule.delayMs / 1000)}s`,
+          `- Retry not before: ${schedule.dueAt.toISOString()}`,
+          ...(spawnCode ? [`- Spawn error code: \`${spawnCode}\``] : []),
+          `- Source run: \`${run.id}\``,
+          `- Retry run: \`${retryRun.id}\``,
+        ].join("\n"),
+        { agentId: agent.id, runId: run.id },
+      ).catch((err) => {
+        logger.warn({ err, runId: run.id, issueId }, "failed to post transient adapter spawn retry comment");
+      });
+    }
 
     return {
       outcome: "scheduled" as const,
@@ -5973,6 +6081,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       },
     });
 
+    await finalizeAgentStatus(run.agentId, "cancelled");
+
     return cancelled;
   }
 
@@ -6239,6 +6349,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       resultJson?: Record<string, unknown> | null;
       errorCode?: string | null;
       errorMessage?: string | null;
+      adapterSpawnErrorCode?: string | null;
     },
   ) {
     const stopMetadata = buildHeartbeatRunStopMetadata({
@@ -6247,6 +6358,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       outcome,
       errorCode: options?.errorCode ?? null,
       errorMessage: options?.errorMessage ?? null,
+      adapterSpawnErrorCode: options?.adapterSpawnErrorCode ?? null,
     });
     return mergeHeartbeatRunStopMetadata(options?.resultJson ?? null, stopMetadata);
   }
@@ -6478,6 +6590,88 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       const processPidAlive = tracksLocalChild && run.processPid && isProcessAlive(run.processPid);
       const processGroupAlive = tracksLocalChild && run.processGroupId && isProcessGroupAlive(run.processGroupId);
       if (processPidAlive) {
+        const detachedAgeMs = detachedProcessAgeMsForRun(run, now);
+        const outputSilenceAgeMs = outputSilenceAgeMsForRun(run, now);
+        const shouldRecoverDetachedProcess = run.errorCode === DETACHED_PROCESS_ERROR_CODE &&
+          (detachedAgeMs ?? 0) >= DETACHED_PROCESS_RECOVERY_THRESHOLD_MS &&
+          (outputSilenceAgeMs ?? 0) >= DETACHED_PROCESS_RECOVERY_THRESHOLD_MS;
+
+        if (shouldRecoverDetachedProcess) {
+          await terminateHeartbeatRunProcess({
+            pid: run.processPid,
+            processGroupId: run.processGroupId,
+          });
+
+          const shouldRetry =
+            tracksLocalChild && (!!run.processPid || !!run.processGroupId) && (run.processLossRetryCount ?? 0) < 1;
+          const recoveryMessage = [
+            `Recovered detached local child process -- lost in-memory handle for pid ${run.processPid}`,
+            `detached for ${Math.round((detachedAgeMs ?? 0) / 1000)}s`,
+            `output silent for ${Math.round((outputSilenceAgeMs ?? 0) / 1000)}s`,
+            "terminated orphaned process",
+            shouldRetry ? "retrying once" : "no retry attempts remain",
+          ].join("; ");
+
+          let finalizedRun = await setRunStatus(run.id, "failed", {
+            error: recoveryMessage,
+            errorCode: DETACHED_PROCESS_RECOVERED_ERROR_CODE,
+            finishedAt: now,
+            resultJson: mergeRunStopMetadataForAgent(
+              { adapterType, adapterConfig },
+              "failed",
+              {
+                resultJson: parseObject(run.resultJson),
+                errorCode: DETACHED_PROCESS_RECOVERED_ERROR_CODE,
+                errorMessage: recoveryMessage,
+              },
+            ),
+          });
+          await setWakeupStatus(run.wakeupRequestId, "failed", {
+            finishedAt: now,
+            error: recoveryMessage,
+          });
+          if (!finalizedRun) finalizedRun = await getRun(run.id);
+          if (!finalizedRun) continue;
+          finalizedRun = await classifyAndPersistRunLiveness(finalizedRun, parseObject(finalizedRun.resultJson)) ?? finalizedRun;
+          await appendRunEvent(finalizedRun, await nextRunEventSeq(finalizedRun.id), {
+            eventType: "lifecycle",
+            stream: "system",
+            level: "warn",
+            message: "detached process recovered",
+            payload: {
+              processPid: run.processPid,
+              processGroupId: run.processGroupId,
+              detachedAgeMs,
+              outputSilenceAgeMs,
+              recoveryThresholdMs: DETACHED_PROCESS_RECOVERY_THRESHOLD_MS,
+              shouldRetry,
+            },
+          });
+          await releaseEnvironmentLeasesForRun({
+            runId: finalizedRun.id,
+            companyId: finalizedRun.companyId,
+            agentId: finalizedRun.agentId,
+            status: finalizedRun.status,
+            failureReason: finalizedRun.error ?? undefined,
+          });
+
+          let retriedRun = null;
+          if (shouldRetry) {
+            const agent = await getAgent(run.agentId);
+            if (agent) {
+              retriedRun = await enqueueProcessLossRetry(finalizedRun, agent, now);
+            }
+          }
+          if (!retriedRun) {
+            await releaseIssueExecutionAndPromote(finalizedRun);
+            await finalizeAgentStatus(finalizedRun.agentId, "failed");
+            await startNextQueuedRunForAgent(finalizedRun.agentId);
+          }
+          runningProcesses.delete(run.id);
+          reaped.push(finalizedRun.id);
+          continue;
+        }
+
         if (run.errorCode !== DETACHED_PROCESS_ERROR_CODE) {
           const detachedMessage = `Lost in-memory process handle, but child pid ${run.processPid} is still alive`;
           const detachedRun = await setRunStatus(run.id, "running", {
@@ -6492,6 +6686,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               message: detachedMessage,
               payload: {
                 processPid: run.processPid,
+                outputSilenceAgeMs,
+                recoveryThresholdMs: DETACHED_PROCESS_RECOVERY_THRESHOLD_MS,
               },
             });
           }
@@ -7782,6 +7978,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             : outcome === "failed"
               ? (adapterResult.errorCode ?? "adapter_failed")
               : null;
+      const adapterSpawnErrorCode = readAdapterSpawnErrorCode({ resultJson: adapterResult.resultJson ?? null });
 
       let logSummary: { bytes: number; sha256?: string; compressed: boolean } | null = null;
       if (handle) {
@@ -7840,6 +8037,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           ),
           errorCode: runErrorCode,
           errorMessage: runErrorMessage,
+          adapterSpawnErrorCode,
         }),
         adapterResult.summary ?? null,
       );
@@ -7921,7 +8119,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             });
           }
         } else if (outcome === "failed" && readTransientRecoveryContractFromRun(livenessRun)) {
-          await scheduleBoundedRetryForRun(livenessRun, agent);
+          const recoveryContract = readTransientRecoveryContractFromRun(livenessRun);
+          await scheduleBoundedRetryForRun(
+            livenessRun,
+            agent,
+            recoveryContract?.errorFamily === "transient_adapter_spawn"
+              ? {
+                  retryReason: TRANSIENT_ADAPTER_SPAWN_RETRY_REASON,
+                  wakeReason: TRANSIENT_ADAPTER_SPAWN_RETRY_WAKE_REASON,
+                }
+              : undefined,
+          );
         }
         const issueCommentPolicyResult = await finalizeIssueCommentPolicy(livenessRun, agent);
         await releaseIssueExecutionAndPromote(livenessRun);
@@ -7967,6 +8175,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         err instanceof Error ? err.message : "Unknown adapter failure",
         await getCurrentUserRedactionOptions(),
       );
+      const adapterSpawnErrorCode = readAdapterSpawnErrorCode({ error: err });
+      const transientAdapterSpawnFailure = isTransientAdapterSpawnErrorCode(adapterSpawnErrorCode);
       logger.error({ err, runId }, "heartbeat execution failed");
 
       let logSummary: { bytes: number; sha256?: string; compressed: boolean } | null = null;
@@ -7990,8 +8200,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         errorCode: "adapter_failed",
         finishedAt: new Date(),
         resultJson: mergeRunStopMetadataForAgent(agent, "failed", {
+          resultJson: {
+            ...(adapterSpawnErrorCode ? { adapterSpawnErrorCode } : {}),
+            adapterSpawnFailureTransient: transientAdapterSpawnFailure,
+            ...(transientAdapterSpawnFailure ? { errorFamily: "transient_adapter_spawn" } : {}),
+          },
           errorCode: "adapter_failed",
           errorMessage: message,
+          adapterSpawnErrorCode,
         }),
         stdoutExcerpt,
         stderrExcerpt,
@@ -8013,6 +8229,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         });
         const livenessRun = await classifyAndPersistRunLiveness(failedRun) ?? failedRun;
         await refreshContinuationSummaryForRun(livenessRun, agent);
+        if (readTransientRecoveryContractFromRun(livenessRun)?.errorFamily === "transient_adapter_spawn") {
+          await scheduleBoundedRetryForRun(livenessRun, agent, {
+            retryReason: TRANSIENT_ADAPTER_SPAWN_RETRY_REASON,
+            wakeReason: TRANSIENT_ADAPTER_SPAWN_RETRY_WAKE_REASON,
+          });
+        }
         await finalizeIssueCommentPolicy(livenessRun, agent);
         await releaseIssueExecutionAndPromote(livenessRun);
 
@@ -8045,6 +8267,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           // Setup code before adapter.execute threw (e.g. ensureRuntimeState, resolveWorkspaceForRun).
           // The inner catch did not fire, so we must record the failure here.
           const message = outerErr instanceof Error ? outerErr.message : "Unknown setup failure";
+          const adapterSpawnErrorCode = readAdapterSpawnErrorCode({ error: outerErr });
+          const transientAdapterSpawnFailure = isTransientAdapterSpawnErrorCode(adapterSpawnErrorCode);
           logger.error({ err: outerErr, runId }, "heartbeat execution setup failed");
           const setupFailureAgent = await getAgent(run.agentId).catch(() => null);
           await setRunStatus(runId, "failed", {
@@ -8053,8 +8277,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             finishedAt: new Date(),
             ...(setupFailureAgent ? {
               resultJson: mergeRunStopMetadataForAgent(setupFailureAgent, "failed", {
+                resultJson: {
+                  ...(adapterSpawnErrorCode ? { adapterSpawnErrorCode } : {}),
+                  adapterSpawnFailureTransient: transientAdapterSpawnFailure,
+                  ...(transientAdapterSpawnFailure ? { errorFamily: "transient_adapter_spawn" } : {}),
+                },
                 errorCode: "adapter_failed",
                 errorMessage: message,
+                adapterSpawnErrorCode,
               }),
             } : {}),
           }).catch(() => undefined);
@@ -8076,6 +8306,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             const failedAgent = setupFailureAgent ?? await getAgent(run.agentId).catch(() => null);
             if (failedAgent) {
               await refreshContinuationSummaryForRun(livenessRun, failedAgent).catch(() => undefined);
+              if (readTransientRecoveryContractFromRun(livenessRun)?.errorFamily === "transient_adapter_spawn") {
+                await scheduleBoundedRetryForRun(livenessRun, failedAgent, {
+                  retryReason: TRANSIENT_ADAPTER_SPAWN_RETRY_REASON,
+                  wakeReason: TRANSIENT_ADAPTER_SPAWN_RETRY_WAKE_REASON,
+                }).catch(() => undefined);
+              }
               await finalizeIssueCommentPolicy(livenessRun, failedAgent).catch(() => undefined);
             }
             await releaseIssueExecutionAndPromote(livenessRun).catch(() => undefined);

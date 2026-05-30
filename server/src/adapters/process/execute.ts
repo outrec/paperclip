@@ -11,6 +11,13 @@ import {
   runChildProcess,
 } from "../utils.js";
 
+const TRANSIENT_SPAWN_ERROR_CODES = new Set(["EAGAIN", "ENOMEM", "ETXTBSY", "EMFILE", "ENFILE"]);
+
+function readSpawnErrorCode(error: unknown) {
+  const code = (error as { code?: unknown } | null)?.code;
+  return typeof code === "string" && code.length > 0 ? code : null;
+}
+
 export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExecutionResult> {
   const { runId, agent, config, onLog, onMeta } = ctx;
   const command = asString(config.command, "");
@@ -44,13 +51,31 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     });
   }
 
-  const proc = await runChildProcess(runId, command, args, {
-    cwd,
-    env,
-    timeoutSec,
-    graceSec,
-    onLog,
-  });
+  let proc;
+  try {
+    proc = await runChildProcess(runId, command, args, {
+      cwd,
+      env,
+      timeoutSec,
+      graceSec,
+      onLog,
+    });
+  } catch (err) {
+    const spawnErrorCode = readSpawnErrorCode(err);
+    const transientSpawn = spawnErrorCode ? TRANSIENT_SPAWN_ERROR_CODES.has(spawnErrorCode) : false;
+    return {
+      exitCode: null,
+      signal: null,
+      timedOut: false,
+      errorMessage: err instanceof Error ? err.message : "Process adapter failed to spawn",
+      errorCode: "adapter_failed",
+      errorFamily: transientSpawn ? "transient_adapter_spawn" : null,
+      resultJson: {
+        adapterSpawnErrorCode: spawnErrorCode,
+        adapterSpawnFailureTransient: transientSpawn,
+      },
+    };
+  }
 
   if (proc.timedOut) {
     return {

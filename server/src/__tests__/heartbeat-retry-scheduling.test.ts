@@ -11,6 +11,7 @@ import {
   environmentLeases,
   heartbeatRunEvents,
   heartbeatRuns,
+  issueComments,
   issueRelations,
   issues,
 } from "@paperclipai/db";
@@ -22,6 +23,9 @@ import {
   BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS,
   MAX_TURN_CONTINUATION_RETRY_REASON,
   MAX_TURN_CONTINUATION_WAKE_REASON,
+  TRANSIENT_ADAPTER_SPAWN_RETRY_DELAYS_MS,
+  TRANSIENT_ADAPTER_SPAWN_RETRY_REASON,
+  TRANSIENT_ADAPTER_SPAWN_RETRY_WAKE_REASON,
   heartbeatService,
 } from "../services/heartbeat.ts";
 
@@ -48,6 +52,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
   afterEach(async () => {
     await db.delete(heartbeatRunEvents);
     await db.delete(environmentLeases);
+    await db.delete(issueComments);
     await db.delete(issueRelations);
     await db.delete(issues);
     await db.delete(heartbeatRuns);
@@ -68,11 +73,11 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     agentId: string;
     now: Date;
     errorCode: string;
-    errorFamily?: "transient_upstream" | null;
+    errorFamily?: "transient_upstream" | "transient_adapter_spawn" | null;
     retryNotBefore?: string | null;
     scheduledRetryAttempt?: number;
     resultJson?: Record<string, unknown> | null;
-    adapterType?: "codex_local" | "claude_local";
+    adapterType?: "codex_local" | "claude_local" | "process";
     agentName?: string;
   }) {
     const adapterType = input.adapterType ?? "codex_local";
@@ -128,6 +133,61 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
       updatedAt: input.now,
       createdAt: input.now,
     });
+  }
+
+  async function seedAdapterSpawnRetryFixture(input?: {
+    scheduledRetryAttempt?: number;
+    spawnErrorCode?: string;
+  }) {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const issueId = randomUUID();
+    const runId = randomUUID();
+    const now = new Date("2026-05-30T09:00:00.000Z");
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+
+    await seedRetryFixture({
+      runId,
+      companyId,
+      agentId,
+      now,
+      errorCode: "adapter_failed",
+      errorFamily: "transient_adapter_spawn",
+      scheduledRetryAttempt: input?.scheduledRetryAttempt ?? 0,
+      adapterType: "process",
+      agentName: "ProcessAgent",
+      resultJson: {
+        errorFamily: "transient_adapter_spawn",
+        adapterSpawnErrorCode: input?.spawnErrorCode ?? "EAGAIN",
+        adapterSpawnFailureTransient: true,
+      },
+    });
+
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Retry transient spawn",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: agentId,
+      executionRunId: runId,
+      executionAgentNameKey: "processagent",
+      executionLockedAt: now,
+      issueNumber: 1,
+      identifier: `${issuePrefix}-1`,
+    });
+
+    await db
+      .update(heartbeatRuns)
+      .set({
+        contextSnapshot: {
+          issueId,
+          wakeReason: "issue_assigned",
+        },
+      })
+      .where(eq(heartbeatRuns.id, runId));
+
+    return { companyId, agentId, issueId, runId, now };
   }
 
   async function seedMaxTurnFixture(input?: {
@@ -309,6 +369,115 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
       .where(eq(heartbeatRuns.id, scheduled.run.id))
       .then((rows) => rows[0] ?? null);
     expect(promotedRun?.status).toBe("queued");
+  });
+
+  it("schedules transient adapter spawn retry 1 with 60s backoff and structured issue comment", async () => {
+    const { issueId, runId, now } = await seedAdapterSpawnRetryFixture();
+
+    const scheduled = await heartbeat.scheduleBoundedRetry(runId, {
+      now,
+      retryReason: TRANSIENT_ADAPTER_SPAWN_RETRY_REASON,
+      wakeReason: TRANSIENT_ADAPTER_SPAWN_RETRY_WAKE_REASON,
+    });
+
+    expect(scheduled.outcome).toBe("scheduled");
+    if (scheduled.outcome !== "scheduled") return;
+    expect(scheduled.attempt).toBe(1);
+    expect(scheduled.maxAttempts).toBe(3);
+    expect(scheduled.dueAt.toISOString()).toBe(
+      new Date(now.getTime() + TRANSIENT_ADAPTER_SPAWN_RETRY_DELAYS_MS[0]).toISOString(),
+    );
+
+    const retryRun = await db
+      .select({
+        status: heartbeatRuns.status,
+        retryOfRunId: heartbeatRuns.retryOfRunId,
+        scheduledRetryAttempt: heartbeatRuns.scheduledRetryAttempt,
+        scheduledRetryReason: heartbeatRuns.scheduledRetryReason,
+        scheduledRetryAt: heartbeatRuns.scheduledRetryAt,
+        contextSnapshot: heartbeatRuns.contextSnapshot,
+        wakeupRequestId: heartbeatRuns.wakeupRequestId,
+      })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, scheduled.run.id))
+      .then((rows) => rows[0] ?? null);
+
+    expect(retryRun).toMatchObject({
+      status: "scheduled_retry",
+      retryOfRunId: runId,
+      scheduledRetryAttempt: 1,
+      scheduledRetryReason: TRANSIENT_ADAPTER_SPAWN_RETRY_REASON,
+    });
+    expect(retryRun?.scheduledRetryAt?.toISOString()).toBe(scheduled.dueAt.toISOString());
+    expect(retryRun?.contextSnapshot).toMatchObject({
+      retryReason: TRANSIENT_ADAPTER_SPAWN_RETRY_REASON,
+      wakeReason: TRANSIENT_ADAPTER_SPAWN_RETRY_WAKE_REASON,
+      errorFamily: "transient_adapter_spawn",
+      scheduledRetryAttempt: 1,
+    });
+
+    const wakeupRequest = await db
+      .select({ reason: agentWakeupRequests.reason, payload: agentWakeupRequests.payload })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.id, retryRun?.wakeupRequestId ?? ""))
+      .then((rows) => rows[0] ?? null);
+    expect(wakeupRequest?.reason).toBe(TRANSIENT_ADAPTER_SPAWN_RETRY_WAKE_REASON);
+    expect(wakeupRequest?.payload).toMatchObject({
+      retryOfRunId: runId,
+      retryReason: TRANSIENT_ADAPTER_SPAWN_RETRY_REASON,
+      scheduledRetryAttempt: 1,
+    });
+
+    const comment = await db
+      .select({ body: issueComments.body })
+      .from(issueComments)
+      .where(eq(issueComments.issueId, issueId))
+      .then((rows) => rows[0] ?? null);
+    expect(comment?.body).toContain("Scheduled automatic retry for transient adapter spawn failure");
+    expect(comment?.body).toContain(`Retry reason: \`${TRANSIENT_ADAPTER_SPAWN_RETRY_REASON}\``);
+    expect(comment?.body).toContain("Backoff: 60s");
+    expect(comment?.body).toContain("Spawn error code: `EAGAIN`");
+  });
+
+  it("caps transient adapter spawn retries at 3 attempts with 60s, 300s, and 900s backoff", async () => {
+    for (const [attemptIndex, delayMs] of TRANSIENT_ADAPTER_SPAWN_RETRY_DELAYS_MS.entries()) {
+      const { runId, now } = await seedAdapterSpawnRetryFixture({ scheduledRetryAttempt: attemptIndex });
+
+      const scheduled = await heartbeat.scheduleBoundedRetry(runId, {
+        now,
+        retryReason: TRANSIENT_ADAPTER_SPAWN_RETRY_REASON,
+      });
+
+      expect(scheduled.outcome).toBe("scheduled");
+      if (scheduled.outcome !== "scheduled") return;
+      expect(scheduled.attempt).toBe(attemptIndex + 1);
+      expect(scheduled.maxAttempts).toBe(3);
+      expect(scheduled.dueAt.toISOString()).toBe(new Date(now.getTime() + delayMs).toISOString());
+
+      await db.delete(issueComments);
+      await db.delete(heartbeatRunEvents);
+      await db.delete(environmentLeases);
+      await db.delete(issueRelations);
+      await db.delete(issues);
+      await db.delete(heartbeatRuns);
+      await db.delete(agentWakeupRequests);
+      await db.delete(agentRuntimeState);
+      await db.delete(budgetPolicies);
+      await db.delete(agents);
+      await db.delete(companies);
+    }
+
+    const { runId, now } = await seedAdapterSpawnRetryFixture({ scheduledRetryAttempt: 3 });
+    const exhausted = await heartbeat.scheduleBoundedRetry(runId, {
+      now,
+      retryReason: TRANSIENT_ADAPTER_SPAWN_RETRY_REASON,
+    });
+
+    expect(exhausted).toEqual({
+      outcome: "retry_exhausted",
+      attempt: 4,
+      maxAttempts: 3,
+    });
   });
 
   it("schedules max-turn continuations with distinct retry metadata", async () => {
