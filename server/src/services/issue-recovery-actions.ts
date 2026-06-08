@@ -12,6 +12,38 @@ import type {
 const ACTIVE_RECOVERY_ACTION_STATUSES = ["active", "escalated"] as const satisfies readonly IssueRecoveryActionStatus[];
 const MAX_UPSERT_RETRIES = 3;
 
+/**
+ * Max consecutive same-error-class attempts before we stop bumping attemptCount
+ * and switch ownerType to "board" for board escalation.
+ */
+const ADAPTER_FAILURE_MAX_SAME_CLASS_ATTEMPTS = 3;
+
+/**
+ * Minimum gap between recovery-action wakes for the same error class (ms).
+ * Within this window, the upsert is a no-op: it returns the existing action
+ * unchanged so no new wake is enqueued.
+ */
+const ADAPTER_FAILURE_BACKOFF_MS = 10 * 60 * 1000; // 10 minutes
+
+/**
+ * Error codes that represent transient adapter failures (quota, rate-limit, auth).
+ * These are the ones that loop infinitely without backoff.
+ */
+const TRANSIENT_ADAPTER_ERROR_CODES = new Set([
+  "adapter_failed",
+  "rate_limit",
+  "quota_exhausted",
+  "auth_failed",
+]);
+
+function isTransientAdapterError(errorCode: string | null | undefined): boolean {
+  return !!errorCode && TRANSIENT_ADAPTER_ERROR_CODES.has(errorCode);
+}
+
+function sameTransientErrorClass(a: string | null | undefined, b: string | null | undefined): boolean {
+  return isTransientAdapterError(a) && isTransientAdapterError(b);
+}
+
 type IssueRecoveryActionRow = typeof issueRecoveryActions.$inferSelect;
 type DbTransaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
 type DbOrTransaction = Db | DbTransaction;
@@ -177,6 +209,46 @@ export function issueRecoveryActionService(db: Db) {
   ): Promise<IssueRecoveryAction> {
     const existing = await getActiveForIssue(input.companyId, input.sourceIssueId);
     const now = new Date();
+
+    // --- I1/I2: per-error-class backoff + max-attempt cap ---
+    // When the incoming attempt and the existing action share a transient adapter
+    // error class, enforce a cooldown and an attempt ceiling to prevent infinite loops.
+    if (existing) {
+      const incomingErrorCode = (input.evidence as Record<string, unknown> | undefined)?.latestRunErrorCode as string | null | undefined;
+      const existingErrorCode = (existing.evidence as Record<string, unknown> | undefined)?.latestRunErrorCode as string | null | undefined;
+
+      if (sameTransientErrorClass(incomingErrorCode, existingErrorCode)) {
+        // Within the backoff window: no-op — return existing action unchanged so no
+        // new wake is enqueued by the caller.
+        const lastAttempt = existing.lastAttemptAt ? new Date(existing.lastAttemptAt).getTime() : 0;
+        if (now.getTime() - lastAttempt < ADAPTER_FAILURE_BACKOFF_MS) {
+          return existing;
+        }
+
+        // Cap reached: flip to board escalation instead of bumping agent loop.
+        if (existing.attemptCount >= ADAPTER_FAILURE_MAX_SAME_CLASS_ATTEMPTS) {
+          const [escalated] = await db
+            .update(issueRecoveryActions)
+            .set({
+              ownerType: "board",
+              ownerAgentId: null,
+              status: "escalated",
+              wakePolicy: { type: "board_escalation", reason: "adapter_failure_cap_reached" },
+              lastAttemptAt: now,
+              updatedAt: now,
+            })
+            .where(
+              and(
+                eq(issueRecoveryActions.id, existing.id),
+                inArray(issueRecoveryActions.status, [...ACTIVE_RECOVERY_ACTION_STATUSES]),
+              ),
+            )
+            .returning();
+          return escalated ? toReadModel(escalated) : existing;
+        }
+      }
+    }
+
     const ownerType = input.ownerType ?? (input.ownerAgentId ? "agent" : "board");
     if (existing) {
       const [updated] = await db

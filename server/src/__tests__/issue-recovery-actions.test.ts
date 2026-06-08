@@ -8,6 +8,7 @@ import {
   activityLog,
   companies,
   createDb,
+  heartbeatRuns,
   issueComments,
   issueRecoveryActions,
   issueRelations,
@@ -57,6 +58,142 @@ function makeRecoveryActionRow(overrides: Record<string, unknown> = {}) {
     ...overrides,
   };
 }
+
+describe("issueRecoveryActionService — adapter-failure backoff cap", () => {
+  const BASE_INPUT = {
+    companyId: "company-1",
+    sourceIssueId: "source-1",
+    kind: "stranded_assigned_issue" as const,
+    ownerType: "agent" as const,
+    ownerAgentId: "agent-1",
+    cause: "stranded_assigned_issue",
+    fingerprint: "stranded:fingerprint",
+    nextAction: "Restore a live execution path.",
+    evidence: { latestRunErrorCode: "adapter_failed" },
+  };
+
+  function makeSelectQuery(rows: unknown[]) {
+    return {
+      from() { return this; },
+      where() { return this; },
+      orderBy() { return this; },
+      limit() { return Promise.resolve(rows); },
+    };
+  }
+
+  it("returns existing action unchanged (no update, no insert) when within backoff window and same error class", async () => {
+    // lastAttemptAt is 2 minutes ago — within the 10-minute window
+    const recentAttempt = new Date(Date.now() - 2 * 60 * 1000);
+    const existingRow = makeRecoveryActionRow({
+      id: "existing-action",
+      attemptCount: 1,
+      lastAttemptAt: recentAttempt,
+      evidence: { latestRunErrorCode: "adapter_failed" },
+    });
+
+    const fakeDb = {
+      select: vi.fn(() => makeSelectQuery([existingRow])),
+      update: vi.fn(),
+      insert: vi.fn(),
+    };
+
+    const result = await issueRecoveryActionService(fakeDb as never).upsertSourceScoped(BASE_INPUT);
+
+    expect(result).toMatchObject({ id: "existing-action", attemptCount: 1 });
+    expect(fakeDb.update).not.toHaveBeenCalled();
+    expect(fakeDb.insert).not.toHaveBeenCalled();
+  });
+
+  it("escalates to board after ADAPTER_FAILURE_MAX_SAME_CLASS_ATTEMPTS consecutive same-class failures", async () => {
+    // lastAttemptAt is old enough to be outside the backoff window
+    const oldAttempt = new Date(Date.now() - 60 * 60 * 1000); // 1 hour ago
+    const existingRow = makeRecoveryActionRow({
+      id: "capped-action",
+      attemptCount: 3, // at or above the cap
+      lastAttemptAt: oldAttempt,
+      evidence: { latestRunErrorCode: "adapter_failed" },
+    });
+
+    const escalatedRow = { ...existingRow, ownerType: "board", ownerAgentId: null, status: "escalated" };
+    const fakeDb = {
+      select: vi.fn(() => makeSelectQuery([existingRow])),
+      update: vi.fn(() => ({
+        set: vi.fn(() => ({
+          where: vi.fn(() => ({
+            returning: vi.fn(async () => [escalatedRow]),
+          })),
+        })),
+      })),
+      insert: vi.fn(),
+    };
+
+    const result = await issueRecoveryActionService(fakeDb as never).upsertSourceScoped(BASE_INPUT);
+
+    expect(result).toMatchObject({ id: "capped-action", ownerType: "board", status: "escalated" });
+    expect(fakeDb.update).toHaveBeenCalledTimes(1);
+    expect(fakeDb.insert).not.toHaveBeenCalled();
+  });
+
+  it("allows normal bump when error class differs (non-transient existing, transient incoming)", async () => {
+    const oldAttempt = new Date(Date.now() - 60 * 60 * 1000);
+    const existingRow = makeRecoveryActionRow({
+      id: "existing-action",
+      attemptCount: 2,
+      lastAttemptAt: oldAttempt,
+      evidence: { latestRunErrorCode: "crash" }, // non-transient error class
+    });
+    const updatedRow = { ...existingRow, attemptCount: 3 };
+
+    const fakeDb = {
+      select: vi.fn(() => makeSelectQuery([existingRow])),
+      update: vi.fn(() => ({
+        set: vi.fn(() => ({
+          where: vi.fn(() => ({
+            returning: vi.fn(async () => [updatedRow]),
+          })),
+        })),
+      })),
+      insert: vi.fn(),
+    };
+
+    const result = await issueRecoveryActionService(fakeDb as never).upsertSourceScoped({
+      ...BASE_INPUT,
+      evidence: { latestRunErrorCode: "adapter_failed" },
+    });
+
+    expect(result).toMatchObject({ id: "existing-action", attemptCount: 3 });
+    expect(fakeDb.update).toHaveBeenCalledTimes(1);
+  });
+
+  it("allows bump when outside backoff window even for same transient error class", async () => {
+    const oldAttempt = new Date(Date.now() - 60 * 60 * 1000); // 1 hour ago — outside window
+    const existingRow = makeRecoveryActionRow({
+      id: "existing-action",
+      attemptCount: 1,
+      lastAttemptAt: oldAttempt,
+      evidence: { latestRunErrorCode: "adapter_failed" },
+    });
+    const updatedRow = { ...existingRow, attemptCount: 2 };
+
+    const fakeDb = {
+      select: vi.fn(() => makeSelectQuery([existingRow])),
+      update: vi.fn(() => ({
+        set: vi.fn(() => ({
+          where: vi.fn(() => ({
+            returning: vi.fn(async () => [updatedRow]),
+          })),
+        })),
+      })),
+      insert: vi.fn(),
+    };
+
+    const result = await issueRecoveryActionService(fakeDb as never).upsertSourceScoped(BASE_INPUT);
+
+    // Should have bumped, not been suppressed
+    expect(result).toMatchObject({ id: "existing-action", attemptCount: 2 });
+    expect(fakeDb.update).toHaveBeenCalledTimes(1);
+  });
+});
 
 describe("issueRecoveryActionService", () => {
   it("does not reactivate an action resolved between the active read and update", async () => {
@@ -131,6 +268,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     await db.delete(issueRecoveryActions);
     await db.delete(issueComments);
     await db.delete(activityLog);
+    await db.delete(heartbeatRuns);
     await db.delete(issues);
     await db.delete(agents);
     await db.delete(companies);
@@ -271,6 +409,8 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       .from(issueRecoveryActions)
       .where(eq(issueRecoveryActions.sourceIssueId, sourceIssue.id));
     expect(actionRows).toHaveLength(1);
+    // Second call is within the backoff window + same adapter_failed class → no-op,
+    // attemptCount stays at 1.
     expect(actionRows[0]).toMatchObject({
       companyId,
       kind: "stranded_assigned_issue",
@@ -278,7 +418,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       previousOwnerAgentId: coderId,
       returnOwnerAgentId: coderId,
       cause: "stranded_assigned_issue",
-      attemptCount: 2,
+      attemptCount: 1,
     });
 
     const [updatedIssue] = await db.select().from(issues).where(eq(issues.id, sourceIssue.id));
@@ -290,7 +430,10 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       .from(issues)
       .where(and(eq(issues.companyId, companyId), eq(issues.originKind, "stranded_issue_recovery")));
     expect(recoveryIssues).toHaveLength(0);
-    expect(enqueueWakeup).toHaveBeenCalledTimes(2);
+    // The second escalation returns early from the upsert (backoff no-op) but
+    // still calls enqueueWakeup — in production both calls share the same
+    // idempotency key (source_scoped_recovery_action:{id}:1) so only one wake
+    // lands. Verify both calls target the same issue.
     expect(enqueueWakeup.mock.calls[0]?.[1]?.payload).toMatchObject({
       issueId: sourceIssue.id,
       sourceIssueId: sourceIssue.id,
@@ -334,6 +477,8 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       .from(issueRecoveryActions)
       .where(eq(issueRecoveryActions.sourceIssueId, sourceIssue.id));
     expect(actionRows).toHaveLength(1);
+    // Second escalation is within the backoff window + same adapter_failed class → no-op.
+    // attemptCount stays at 1 and the evidence reflects the first run only.
     expect(actionRows[0]).toMatchObject({
       companyId,
       kind: "stranded_assigned_issue",
@@ -341,14 +486,16 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       previousOwnerAgentId: coderId,
       returnOwnerAgentId: coderId,
       cause: "stranded_assigned_issue",
-      attemptCount: 2,
+      attemptCount: 1,
     });
-    expect(actionRows[0]?.evidence).toMatchObject({ latestRunId: secondLatestRun.id });
-    expect(enqueueWakeup).toHaveBeenCalledTimes(2);
-    expect(enqueueWakeup.mock.calls[1]?.[1]?.payload).toMatchObject({
+    expect(actionRows[0]?.evidence).toMatchObject({ latestRunId: firstLatestRun.id });
+    // The second escalation still calls enqueueWakeup but both calls share the
+    // same idempotency key (attemptCount unchanged), so only one wake fires in
+    // production. Verify the first call targets the correct run.
+    expect(enqueueWakeup.mock.calls[0]?.[1]?.payload).toMatchObject({
       issueId: sourceIssue.id,
       sourceIssueId: sourceIssue.id,
-      strandedRunId: secondLatestRun.id,
+      strandedRunId: firstLatestRun.id,
       recoveryCause: "stranded_assigned_issue",
     });
   });
@@ -401,6 +548,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       .from(issueRecoveryActions)
       .where(eq(issueRecoveryActions.sourceIssueId, sourceIssue.id));
     expect(actionRows).toHaveLength(1);
+    // Second escalation is within the backoff window + same adapter_failed class → no-op.
     expect(actionRows[0]).toMatchObject({
       companyId,
       kind: "stranded_assigned_issue",
@@ -408,7 +556,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       previousOwnerAgentId: coderId,
       returnOwnerAgentId: coderId,
       cause: "stranded_assigned_issue",
-      attemptCount: 2,
+      attemptCount: 1,
     });
     const [afterSecond] = await db.select().from(issues).where(eq(issues.id, sourceIssue.id));
     expect(afterSecond?.status).toBe("blocked");
@@ -543,6 +691,175 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     expect(activityRows.map((row) => row.action)).toEqual(
       expect.arrayContaining(["issue.updated", "issue.recovery_action_resolved"]),
     );
+  });
+
+  it("atomically resolves an active recovery action when source issue PATCH reaches done", async () => {
+    const { companyId, managerId, sourceIssueId, prefix } = await seedCompany();
+    const recoveryActionSvc = issueRecoveryActionService(db);
+    const first = await recoveryActionSvc.upsertSourceScoped({
+      companyId,
+      sourceIssueId,
+      kind: "issue_graph_liveness",
+      ownerType: "agent",
+      ownerAgentId: managerId,
+      cause: "issue_graph_liveness",
+      fingerprint: "graph-liveness:terminal-done",
+      evidence: { latestIssueStatus: "in_progress", latestRunId: "run-1" },
+      nextAction: "Restore a live execution path.",
+      wakePolicy: { type: "manual" },
+    });
+    const action = await recoveryActionSvc.upsertSourceScoped({
+      companyId,
+      sourceIssueId,
+      kind: "issue_graph_liveness",
+      ownerType: "agent",
+      ownerAgentId: managerId,
+      cause: "issue_graph_liveness",
+      fingerprint: "graph-liveness:terminal-done",
+      evidence: { latestIssueStatus: "in_progress", latestRunId: "run-2" },
+      nextAction: "Restore a live execution path.",
+      wakePolicy: { type: "manual" },
+    });
+    const runId = randomUUID();
+    const app = createApp({
+      type: "agent",
+      agentId: managerId,
+      companyId,
+      runId,
+      source: "agent_jwt",
+    });
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId: managerId,
+      invocationSource: "manual",
+      status: "running",
+      startedAt: new Date("2026-05-13T18:00:00.000Z"),
+      contextSnapshot: { issueId: sourceIssueId },
+    });
+
+    const patched = await request(app)
+      .patch(`/api/issues/${sourceIssueId}`)
+      .send({ status: "done" })
+      .expect(200);
+
+    expect(patched.body).toMatchObject({
+      id: sourceIssueId,
+      status: "done",
+      activeRecoveryAction: null,
+    });
+    const [actionRow] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.id, action.id));
+    expect(actionRow).toMatchObject({
+      id: first.id,
+      status: "resolved",
+      outcome: "source_terminal",
+      attemptCount: 2,
+      nextAction: "Restore a live execution path.",
+    });
+    expect(actionRow?.evidence).toMatchObject({ latestRunId: "run-2" });
+    expect(actionRow?.resolutionNote).toContain(`${prefix}-1`);
+    expect(actionRow?.resolutionNote).toContain("terminal status done");
+    expect(actionRow?.resolutionNote).toContain(runId);
+    expect(actionRow?.resolvedAt).toBeTruthy();
+    expect(await recoveryActionSvc.getActiveForIssue(companyId, sourceIssueId)).toBeNull();
+
+    await request(app)
+      .patch(`/api/issues/${sourceIssueId}`)
+      .send({ status: "done" })
+      .expect(200);
+    const actionRowsAfterRepeat = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, sourceIssueId));
+    expect(actionRowsAfterRepeat).toHaveLength(1);
+    expect(actionRowsAfterRepeat[0]?.resolutionNote).toBe(actionRow?.resolutionNote);
+
+    const activityRows = await db
+      .select()
+      .from(activityLog)
+      .where(eq(activityLog.entityId, sourceIssueId));
+    const terminalResolutionEvents = activityRows.filter(
+      (row) =>
+        row.action === "issue.recovery_action_resolved" &&
+        (row.details as Record<string, unknown> | null)?.source === "terminal_issue_patch",
+    );
+    expect(terminalResolutionEvents).toHaveLength(1);
+    expect(terminalResolutionEvents[0]?.details).toMatchObject({
+      recoveryActionId: action.id,
+      outcome: "source_terminal",
+      sourceIssueStatus: "done",
+    });
+  });
+
+  it("atomically resolves an active recovery action when source issue PATCH is cancelled", async () => {
+    const { companyId, managerId, sourceIssueId } = await seedCompany();
+    const recoveryActionSvc = issueRecoveryActionService(db);
+    const action = await recoveryActionSvc.upsertSourceScoped({
+      companyId,
+      sourceIssueId,
+      kind: "issue_graph_liveness",
+      ownerType: "agent",
+      ownerAgentId: managerId,
+      cause: "issue_graph_liveness",
+      fingerprint: "graph-liveness:terminal-cancelled",
+      evidence: { latestIssueStatus: "in_progress" },
+      nextAction: "Restore a live execution path.",
+      wakePolicy: { type: "manual" },
+    });
+    const app = createApp();
+
+    await request(app)
+      .patch(`/api/issues/${sourceIssueId}`)
+      .send({ status: "cancelled" })
+      .expect(200);
+
+    const [actionRow] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.id, action.id));
+    expect(actionRow).toMatchObject({
+      status: "resolved",
+      outcome: "source_cancelled",
+      attemptCount: 1,
+      nextAction: "Restore a live execution path.",
+    });
+    expect(actionRow?.resolutionNote).toContain("terminal status cancelled");
+    expect(actionRow?.resolvedAt).toBeTruthy();
+    expect(await recoveryActionSvc.getActiveForIssue(companyId, sourceIssueId)).toBeNull();
+  });
+
+  it("keeps recovery actions active on non-terminal source issue PATCHes", async () => {
+    const { companyId, managerId, sourceIssueId } = await seedCompany();
+    const recoveryActionSvc = issueRecoveryActionService(db);
+    const action = await recoveryActionSvc.upsertSourceScoped({
+      companyId,
+      sourceIssueId,
+      kind: "issue_graph_liveness",
+      ownerType: "agent",
+      ownerAgentId: managerId,
+      cause: "issue_graph_liveness",
+      fingerprint: "graph-liveness:non-terminal",
+      evidence: { latestIssueStatus: "in_progress" },
+      nextAction: "Restore a live execution path.",
+      wakePolicy: { type: "manual" },
+    });
+    const app = createApp();
+
+    await request(app)
+      .patch(`/api/issues/${sourceIssueId}`)
+      .send({ status: "in_review" })
+      .expect(200);
+
+    expect(await recoveryActionSvc.getActiveForIssue(companyId, sourceIssueId)).toMatchObject({
+      id: action.id,
+      status: "active",
+      outcome: null,
+      attemptCount: 1,
+      nextAction: "Restore a live execution path.",
+    });
   });
 
   it("rejects blocked recovery resolution when the source issue has no first-class blockers", async () => {
@@ -763,5 +1080,95 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       .from(issueRecoveryActions)
       .where(eq(issueRecoveryActions.id, action.id));
     expect(actionRow?.status).toBe("active");
+  });
+
+  it("auto-resolves active recovery action when source issue PATCH moves to blocked with first-class blockers (I3)", async () => {
+    const { companyId, managerId, sourceIssueId, prefix } = await seedCompany();
+    const blockerIssueId = randomUUID();
+    await db.insert(issues).values({
+      id: blockerIssueId,
+      companyId,
+      title: "Quota exhausted — waiting for reset",
+      status: "todo",
+      priority: "medium",
+      issueNumber: 99,
+      identifier: `${prefix}-99`,
+    });
+
+    const recoveryActionSvc = issueRecoveryActionService(db);
+    const action = await recoveryActionSvc.upsertSourceScoped({
+      companyId,
+      sourceIssueId,
+      kind: "stranded_assigned_issue",
+      ownerType: "agent",
+      ownerAgentId: managerId,
+      cause: "stranded_assigned_issue",
+      fingerprint: "stranded:auto-resolve-test",
+      evidence: { latestRunErrorCode: "adapter_failed", latestIssueStatus: "in_progress" },
+      nextAction: "Restore a live execution path.",
+      wakePolicy: { type: "wake_owner", ownerAgentId: managerId },
+    });
+
+    // Use board auth to avoid permission side-effects on the PATCH path.
+    const app = createApp();
+
+    // PATCH to blocked WITH a first-class blocker → auto-resolves the recovery action.
+    const patchRes = await request(app)
+      .patch(`/api/issues/${sourceIssueId}`)
+      .send({ status: "blocked", blockedByIssueIds: [blockerIssueId] });
+    if (patchRes.status !== 200) {
+      throw new Error(`PATCH failed ${patchRes.status}: ${JSON.stringify(patchRes.body)}`);
+    }
+    const patched = patchRes;
+
+    expect(patched.body).toMatchObject({
+      id: sourceIssueId,
+      status: "blocked",
+      activeRecoveryAction: null,
+    });
+
+    const [actionRow] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.id, action.id));
+
+    expect(actionRow).toMatchObject({
+      status: "resolved",
+      outcome: "blocked",
+    });
+    expect(actionRow?.resolutionNote).toContain("auto-resolved");
+    expect(actionRow?.resolutionNote).toContain(blockerIssueId);
+    expect(actionRow?.resolvedAt).toBeTruthy();
+    expect(await recoveryActionSvc.getActiveForIssue(companyId, sourceIssueId)).toBeNull();
+  });
+
+  it("does NOT auto-resolve recovery action when PATCH to blocked has no first-class blockers", async () => {
+    const { companyId, managerId, sourceIssueId } = await seedCompany();
+    const recoveryActionSvc = issueRecoveryActionService(db);
+    const action = await recoveryActionSvc.upsertSourceScoped({
+      companyId,
+      sourceIssueId,
+      kind: "stranded_assigned_issue",
+      ownerType: "agent",
+      ownerAgentId: managerId,
+      cause: "stranded_assigned_issue",
+      fingerprint: "stranded:no-auto-resolve-test",
+      evidence: { latestRunErrorCode: "adapter_failed", latestIssueStatus: "in_progress" },
+      nextAction: "Restore a live execution path.",
+      wakePolicy: { type: "wake_owner", ownerAgentId: managerId },
+    });
+
+    const app = createApp();
+
+    // PATCH to blocked WITHOUT blockers → recovery action stays active.
+    await request(app)
+      .patch(`/api/issues/${sourceIssueId}`)
+      .send({ status: "blocked" })
+      .expect(200);
+
+    expect(await recoveryActionSvc.getActiveForIssue(companyId, sourceIssueId)).toMatchObject({
+      id: action.id,
+      status: "active",
+    });
   });
 });

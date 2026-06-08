@@ -2980,6 +2980,41 @@ export function issueRoutes(
       actorType: req.actor.type,
     });
 
+    const movingToBlocked =
+      existing.status !== "blocked" &&
+      updateFields.status === "blocked";
+    const incomingBlockerIds: string[] =
+      Array.isArray(updateFields.blockedByIssueIds)
+        ? (updateFields.blockedByIssueIds as string[])
+        : [];
+    // I3: if moving to blocked with first-class blockers, auto-resolve the active
+    // recovery action so it stops firing wakes.
+    const blockedWithFirstClassBlockers = movingToBlocked && incomingBlockerIds.length > 0;
+
+    const terminalRecoveryOutcome =
+      existing.status !== updateFields.status && updateFields.status === "done"
+        ? "source_terminal"
+        : existing.status !== updateFields.status && updateFields.status === "cancelled"
+          ? "source_cancelled"
+          : blockedWithFirstClassBlockers
+            ? "blocked"
+            : null;
+    const terminalRecoveryResolutionNote = terminalRecoveryOutcome
+      ? terminalRecoveryOutcome === "blocked"
+        ? [
+            `Recovery action auto-resolved because source issue ${existing.identifier ?? existing.id} moved to blocked with first-class blockers.`,
+            `Blocker issue ids: ${incomingBlockerIds.join(", ")}.`,
+            `Timestamp: ${new Date().toISOString()}.`,
+            `Run id: ${actor.runId ?? "none provided"}.`,
+          ].join(" ")
+        : [
+            `Recovery action resolved atomically because source issue ${existing.identifier ?? existing.id} reached terminal status ${updateFields.status}.`,
+            `Terminal timestamp: ${new Date().toISOString()}.`,
+            "Terminal comment id: unavailable in atomic issue PATCH transaction.",
+            `Terminal run id: ${actor.runId ?? "none provided"}.`,
+          ].join(" ")
+      : null;
+
     const nextAssigneeAgentId =
       updateFields.assigneeAgentId === undefined ? existing.assigneeAgentId : (updateFields.assigneeAgentId as string | null);
     const nextAssigneeUserId =
@@ -3002,6 +3037,7 @@ export function issueRoutes(
     }
 
     let issue;
+    let terminalRecoveryAction: Awaited<ReturnType<typeof recoveryActionsSvc.resolveActiveForIssue>> = null;
     try {
       if (transition.decision && decisionId) {
         const decision = transition.decision;
@@ -3016,6 +3052,19 @@ export function issueRoutes(
             tx,
           );
           if (!updated) return null;
+
+          if (terminalRecoveryOutcome) {
+            terminalRecoveryAction = await recoveryActionsSvc.resolveActiveForIssue(
+              {
+                companyId: existing.companyId,
+                sourceIssueId: existing.id,
+                status: "resolved",
+                outcome: terminalRecoveryOutcome,
+                resolutionNote: terminalRecoveryResolutionNote,
+              },
+              tx,
+            );
+          }
 
           await tx.insert(issueExecutionDecisions).values({
             id: decisionId,
@@ -3033,10 +3082,32 @@ export function issueRoutes(
           return updated;
         });
       } else {
-        issue = await svc.update(id, {
-          ...updateFields,
-          actorAgentId: actor.agentId ?? null,
-          actorUserId: actor.actorType === "user" ? actor.actorId : null,
+        issue = await db.transaction(async (tx) => {
+          const updated = await svc.update(
+            id,
+            {
+              ...updateFields,
+              actorAgentId: actor.agentId ?? null,
+              actorUserId: actor.actorType === "user" ? actor.actorId : null,
+            },
+            tx,
+          );
+          if (!updated) return null;
+
+          if (terminalRecoveryOutcome) {
+            terminalRecoveryAction = await recoveryActionsSvc.resolveActiveForIssue(
+              {
+                companyId: existing.companyId,
+                sourceIssueId: existing.id,
+                status: "resolved",
+                outcome: terminalRecoveryOutcome,
+                resolutionNote: terminalRecoveryResolutionNote,
+              },
+              tx,
+            );
+          }
+
+          return updated;
         });
       }
     } catch (err) {
@@ -3194,6 +3265,32 @@ export function issueRoutes(
         ),
       },
     });
+
+    if (terminalRecoveryAction) {
+      await logActivity(db, {
+        companyId: issue.companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        runId: actor.runId,
+        action: "issue.recovery_action_resolved",
+        entityType: "issue",
+        entityId: issue.id,
+        details: {
+          identifier: issue.identifier,
+          recoveryActionId: terminalRecoveryAction.id,
+          recoveryActionStatus: terminalRecoveryAction.status,
+          outcome: terminalRecoveryAction.outcome,
+          sourceIssueStatus: issue.status,
+          source: "terminal_issue_patch",
+          resolutionNote: terminalRecoveryAction.resolutionNote,
+        },
+      });
+      issueResponse = {
+        ...issueResponse,
+        activeRecoveryAction: null,
+      };
+    }
 
     if (existing.status === "in_progress" && issue.status !== existing.status && issue.status !== "in_progress") {
       await listSuccessfulRunHandoffStates(db, issue.companyId, [issue.id])
