@@ -1181,11 +1181,22 @@ export function mergeModelProfileAdapterConfig(input: {
   modelProfile: ModelProfileApplication;
   issueAdapterConfig: Record<string, unknown> | null | undefined;
 }): Record<string, unknown> {
-  return {
+  const merged = {
     ...input.baseConfig,
     ...(input.modelProfile.adapterConfig ?? {}),
     ...(input.issueAdapterConfig ?? {}),
   };
+  // Preserve the agent's explicitly configured model over any model profile default.
+  // Model profiles may set a fallback model (e.g. the "cheap" profile), but an agent
+  // that has an explicit adapterConfig.model should always use that model unless the
+  // issue-level adapterConfig specifically overrides it.
+  const baseModel = typeof input.baseConfig.model === "string" ? input.baseConfig.model.trim() : "";
+  const issueModel =
+    typeof input.issueAdapterConfig?.model === "string" ? input.issueAdapterConfig.model.trim() : "";
+  if (baseModel && !issueModel) {
+    merged.model = baseModel;
+  }
+  return merged;
 }
 
 function modelProfileRunMetadata(
