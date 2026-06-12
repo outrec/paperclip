@@ -4,6 +4,7 @@ export const RECOVERY_ORIGIN_KINDS = {
   strandedIssueRecovery: "stranded_issue_recovery",
   staleActiveRunEvaluation: "stale_active_run_evaluation",
   staleHeartbeatRunAgent: "stale_heartbeat_run_agent",
+  releaseStaleRun: "release_stale_run",
 } as const;
 
 export const RECOVERY_REASON_KINDS = {

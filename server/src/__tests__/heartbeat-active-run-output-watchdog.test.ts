@@ -3,6 +3,7 @@ import { and, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   agents,
+  approvals,
   companies,
   createDb,
   heartbeatRunWatchdogDecisions,
@@ -15,9 +16,13 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import {
+  ACTIVE_RUN_OUTPUT_ANTIDEDUP_COOLDOWN_MS,
   ACTIVE_RUN_OUTPUT_CONTINUE_REARM_MS,
   ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS,
+  ACTIVE_RUN_OUTPUT_MAX_EVALUATIONS,
   ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS,
+  ACTIVE_RUN_OUTPUT_TERMINAL_SNOOZE_MS,
+  buildPaperclipWakePayload,
   heartbeatService,
 } from "../services/heartbeat.ts";
 import { recoveryService } from "../services/recovery/service.ts";
@@ -101,6 +106,8 @@ describeEmbeddedPostgres("active-run output watchdog", () => {
     lastOutputAgeMs?: number;
     finishedAt?: Date | null;
     logChunk?: string;
+    processPid?: number | null;
+    processGroupId?: number | null;
   }) {
     const companyId = randomUUID();
     const managerId = randomUUID();
@@ -179,6 +186,8 @@ describeEmbeddedPostgres("active-run output watchdog", () => {
       startedAt,
       finishedAt: opts.finishedAt ?? null,
       processStartedAt: startedAt,
+      processPid: opts.processPid ?? null,
+      processGroupId: opts.processGroupId ?? null,
       lastOutputAt,
       lastOutputSeq: lastOutputAt ? 3 : 0,
       lastOutputStream: lastOutputAt ? "stdout" : null,
@@ -236,6 +245,140 @@ describeEmbeddedPostgres("active-run output watchdog", () => {
     });
     expect(evaluations[0]?.description).toContain("Decision Checklist");
     expect(evaluations[0]?.description).not.toContain("sk-test-secret-value");
+  });
+
+  it("embeds a redacted stale-run log tail in the wake payload", async () => {
+    const now = new Date("2026-04-22T20:00:00.000Z");
+    const { companyId, issueId, runId } = await seedRunningRun({
+      now,
+      ageMs: ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS + 60_000,
+      logChunk: [
+        "starting bounded command",
+        "PAPERCLIP_API_KEY=sk-test-secret-value",
+        "find / -type f -name results.jsonl -path *expert*",
+      ].join("\n"),
+    });
+
+    const payload = await buildPaperclipWakePayload({
+      db,
+      companyId,
+      contextSnapshot: {
+        issueId,
+        wakeReason: "issue_assigned",
+        staleRunId: runId,
+      },
+    });
+
+    expect(payload).toMatchObject({
+      reason: "issue_assigned",
+      staleRunEvidence: {
+        runId,
+        logRoute: `/api/heartbeat-runs/${runId}/log`,
+        logTailAvailable: true,
+        process: {
+          inMemoryHandle: false,
+          recoveryOwner: "watchdog-review-assignee",
+        },
+      },
+    });
+    const evidence = payload?.staleRunEvidence as { logTail?: string } | null | undefined;
+    expect(evidence?.logTail).toContain("find / -type f -name results.jsonl");
+    expect(evidence?.logTail).not.toContain("sk-test-secret-value");
+  });
+
+  it("includes host process snapshot and recovery semantics in stale-run review issues", async () => {
+    const now = new Date("2026-04-22T20:00:00.000Z");
+    const { companyId } = await seedRunningRun({
+      now,
+      ageMs: ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS + 60_000,
+      processPid: process.pid,
+    });
+    const heartbeat = heartbeatService(db);
+
+    await heartbeat.scanSilentActiveRuns({ now, companyId });
+
+    const evaluations = await db
+      .select()
+      .from(issues)
+      .where(and(eq(issues.companyId, companyId), eq(issues.originKind, "stale_active_run_evaluation")));
+    expect(evaluations).toHaveLength(1);
+    expect(evaluations[0]?.description).toContain("## Host Process Snapshot");
+    expect(evaluations[0]?.description).toContain(String(process.pid));
+    expect(evaluations[0]?.description).toContain("## Recovery Semantics");
+    expect(evaluations[0]?.description).toContain("watchdog assignee owns the review");
+  });
+
+  it("does not recreate a recently closed false-positive stale-run alert", async () => {
+    const now = new Date("2026-04-22T20:00:00.000Z");
+    const { companyId } = await seedRunningRun({
+      now,
+      ageMs: ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS + 60_000,
+    });
+    const heartbeat = heartbeatService(db);
+
+    const first = await heartbeat.scanSilentActiveRuns({ now, companyId });
+    const evaluationIssueId = first.evaluationIssueIds[0];
+    expect(evaluationIssueId).toBeTruthy();
+
+    const closedAt = new Date(now.getTime() + 60_000);
+    await db
+      .update(issues)
+      .set({ status: "done", updatedAt: closedAt })
+      .where(eq(issues.id, evaluationIssueId));
+
+    const second = await heartbeat.scanSilentActiveRuns({
+      now: new Date(closedAt.getTime() + 60_000),
+      companyId,
+    });
+
+    expect(second).toMatchObject({ created: 0, existing: 1 });
+    expect(second.evaluationIssueIds).toEqual([evaluationIssueId]);
+
+    const evaluations = await db
+      .select()
+      .from(issues)
+      .where(and(eq(issues.companyId, companyId), eq(issues.originKind, "stale_active_run_evaluation")));
+    expect(evaluations).toHaveLength(1);
+  });
+
+  it("reopens a recently closed stale-run alert when severity becomes critical", async () => {
+    const now = new Date("2026-04-22T20:00:00.000Z");
+    const { companyId, issueId } = await seedRunningRun({
+      now,
+      ageMs: ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS - 10 * 60_000,
+    });
+    const heartbeat = heartbeatService(db);
+
+    const first = await heartbeat.scanSilentActiveRuns({ now, companyId });
+    const evaluationIssueId = first.evaluationIssueIds[0];
+    expect(evaluationIssueId).toBeTruthy();
+
+    const closedAt = new Date(now.getTime() + 60_000);
+    await db
+      .update(issues)
+      .set({ status: "done", updatedAt: closedAt })
+      .where(eq(issues.id, evaluationIssueId));
+
+    const criticalAt = new Date(now.getTime() + 11 * 60_000);
+    const scan = await heartbeat.scanSilentActiveRuns({ now: criticalAt, companyId });
+
+    expect(scan).toMatchObject({ created: 0, escalated: 1 });
+    expect(scan.evaluationIssueIds).toEqual([evaluationIssueId]);
+
+    const [evaluation] = await db.select().from(issues).where(eq(issues.id, evaluationIssueId));
+    expect(evaluation).toMatchObject({ status: "todo", priority: "high" });
+
+    const [blocker] = await db
+      .select()
+      .from(issueRelations)
+      .where(and(eq(issueRelations.companyId, companyId), eq(issueRelations.relatedIssueId, issueId)));
+    expect(blocker?.issueId).toBe(evaluationIssueId);
+
+    const evaluations = await db
+      .select()
+      .from(issues)
+      .where(and(eq(issues.companyId, companyId), eq(issues.originKind, "stale_active_run_evaluation")));
+    expect(evaluations).toHaveLength(1);
   });
 
   it("redacts sensitive values from actual run-log evidence", async () => {
@@ -729,5 +872,132 @@ describeEmbeddedPostgres("active-run output watchdog", () => {
       createdByRunId: randomUUID(),
     });
     expect(decision.createdByRunId).toBe(managerRunId);
+  });
+
+  // §A1 / §A3: anti-dedup cooldown + implicit snooze
+  it("does not create a second evaluation within the 60m anti-dedup cooldown and writes an implicit snooze", async () => {
+    const now = new Date("2026-04-22T20:00:00.000Z");
+    const { companyId, runId } = await seedRunningRun({
+      now,
+      ageMs: ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS + 60_000,
+    });
+    const heartbeat = heartbeatService(db);
+
+    // Create the first evaluation.
+    const first = await heartbeat.scanSilentActiveRuns({ now, companyId });
+    const evaluationIssueId = first.evaluationIssueIds[0];
+    expect(evaluationIssueId).toBeTruthy();
+    expect(first.created).toBe(1);
+
+    // Close the evaluation (simulate the assignee marking it done).
+    const closedAt = new Date(now.getTime() + 5 * 60_000);
+    await db.update(issues).set({ status: "done", updatedAt: closedAt }).where(eq(issues.id, evaluationIssueId));
+
+    // Scan again well within the anti-dedup cooldown window — should NOT create a new issue.
+    const secondNow = new Date(closedAt.getTime() + 10 * 60_000); // 10m after close, within 60m window
+    const second = await heartbeat.scanSilentActiveRuns({ now: secondNow, companyId });
+
+    expect(second.created).toBe(0);
+    const allEvaluations = await db
+      .select()
+      .from(issues)
+      .where(and(eq(issues.companyId, companyId), eq(issues.originKind, "stale_active_run_evaluation")));
+    expect(allEvaluations).toHaveLength(1);
+
+    // An implicit snooze decision row should have been written.
+    const snoozeRows = await db
+      .select()
+      .from(heartbeatRunWatchdogDecisions)
+      .where(and(eq(heartbeatRunWatchdogDecisions.companyId, companyId), eq(heartbeatRunWatchdogDecisions.runId, runId)));
+    const autoSnooze = snoozeRows.find((r) => r.decision === "snooze" && r.reason?.includes("anti-dedup cooldown"));
+    expect(autoSnooze).toBeTruthy();
+    expect(autoSnooze?.snoozedUntil).toBeTruthy();
+    const expectedSnoozeEnd = new Date(secondNow.getTime() + ACTIVE_RUN_OUTPUT_TERMINAL_SNOOZE_MS);
+    expect(autoSnooze!.snoozedUntil!.getTime()).toBeCloseTo(expectedSnoozeEnd.getTime(), -3);
+  });
+
+  // §A2: N terminal evaluations → board approval instead of another evaluation issue
+  it(`escalates to a board approval after ${ACTIVE_RUN_OUTPUT_MAX_EVALUATIONS} terminal evaluations without resolving the run`, async () => {
+    const now = new Date("2026-04-22T20:00:00.000Z");
+    const { companyId, managerId, runId, issuePrefix } = await seedRunningRun({
+      now,
+      ageMs: ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS + 60_000,
+    });
+    const heartbeat = heartbeatService(db);
+
+    // Directly seed ACTIVE_RUN_OUTPUT_MAX_EVALUATIONS terminal evaluations so we can
+    // test the churn-cap escalation without timing/cooldown complexity.
+    // Each uses a unique issueNumber so the identifier is unique.
+    const terminalEvalIds: string[] = [];
+    for (let i = 0; i < ACTIVE_RUN_OUTPUT_MAX_EVALUATIONS; i += 1) {
+      const evalId = randomUUID();
+      const issueNumber = 100 + i;
+      await db.insert(issues).values({
+        id: evalId,
+        companyId,
+        title: `Review silent active run (pre-seeded ${i})`,
+        status: "done",  // already terminal
+        priority: "medium",
+        assigneeAgentId: managerId,
+        issueNumber,
+        identifier: `${issuePrefix}-${issueNumber}`,
+        originKind: "stale_active_run_evaluation",
+        originId: runId,
+        originFingerprint: `stale_active_run:${companyId}:${runId}:${i}`, // unique per row
+        updatedAt: new Date(now.getTime() - 2 * 60 * 60 * 1000 - i * 60_000), // older than ANTIDEDUP cooldown
+        createdAt: new Date(now.getTime() - 3 * 60 * 60 * 1000 - i * 60_000),
+      });
+      terminalEvalIds.push(evalId);
+    }
+
+    // The scan at `now` should detect MAX_EVALUATIONS terminal evals and escalate to a board approval.
+    const approvalScan = await heartbeat.scanSilentActiveRuns({ now, companyId });
+
+    // No new evaluation issues should have been created.
+    const allEvaluations = await db
+      .select()
+      .from(issues)
+      .where(and(eq(issues.companyId, companyId), eq(issues.originKind, "stale_active_run_evaluation")));
+    expect(allEvaluations).toHaveLength(ACTIVE_RUN_OUTPUT_MAX_EVALUATIONS);
+    expect(allEvaluations.every((e) => ["done", "cancelled"].includes(e.status))).toBe(true);
+
+    // A board approval of type release_stale_run should exist.
+    const pendingApprovals = await db
+      .select()
+      .from(approvals)
+      .where(and(eq(approvals.companyId, companyId), eq(approvals.type, "release_stale_run"), eq(approvals.status, "pending")));
+    expect(pendingApprovals).toHaveLength(1);
+    expect(pendingApprovals[0]?.payload).toMatchObject({ runId });
+
+    // The second scan must be idempotent: the 24h snooze written by the approval scan makes
+    // the run snoozed, so no second approval is created.
+    await heartbeat.scanSilentActiveRuns({ now: new Date(now.getTime() + 30 * 60_000), companyId });
+    const approvalCount = await db
+      .select()
+      .from(approvals)
+      .where(and(eq(approvals.companyId, companyId), eq(approvals.type, "release_stale_run")));
+    expect(approvalCount).toHaveLength(1);
+  });
+
+  // §C1: evaluation title includes run short-id and silence duration
+  it("includes the run short-id and silence duration in the evaluation title", async () => {
+    const now = new Date("2026-04-22T20:00:00.000Z");
+    const { companyId, runId } = await seedRunningRun({
+      now,
+      ageMs: ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS + 60_000,
+    });
+    const heartbeat = heartbeatService(db);
+
+    await heartbeat.scanSilentActiveRuns({ now, companyId });
+
+    const [evaluation] = await db
+      .select()
+      .from(issues)
+      .where(and(eq(issues.companyId, companyId), eq(issues.originKind, "stale_active_run_evaluation")));
+    expect(evaluation).toBeTruthy();
+    // Title must include the short run ID (first 8 chars).
+    expect(evaluation?.title).toContain(runId.slice(0, 8));
+    // Title must mention silence duration.
+    expect(evaluation?.title).toMatch(/silent\s/i);
   });
 });

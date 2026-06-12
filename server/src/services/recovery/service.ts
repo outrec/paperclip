@@ -1,4 +1,6 @@
 import { and, asc, desc, eq, gt, inArray, isNull, notInArray, sql } from "drizzle-orm";
+import { execFile as execFileCallback } from "node:child_process";
+import { promisify } from "node:util";
 import type { Db } from "@paperclipai/db";
 import {
   DEFAULT_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS,
@@ -49,14 +51,25 @@ const UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES = ["failed", "cancelled", "ti
 export const ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS = 60 * 60 * 1000;
 export const ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS = 4 * 60 * 60 * 1000;
 export const ACTIVE_RUN_OUTPUT_CONTINUE_REARM_MS = 30 * 60 * 1000;
+export const ACTIVE_RUN_OUTPUT_ALERT_WINDOW_ENV = "PAPERCLIP_ACTIVE_RUN_OUTPUT_ALERT_WINDOW_MINUTES";
+export const DEFAULT_ACTIVE_RUN_OUTPUT_ALERT_WINDOW_MS = 30 * 60 * 1000;
+// Anti-dup: after a terminal evaluation closes, suppress new issues for this window.
+export const ACTIVE_RUN_OUTPUT_ANTIDEDUP_COOLDOWN_MS = 60 * 60 * 1000;
+// Implicit snooze duration written when a terminal evaluation suppresses new creation.
+export const ACTIVE_RUN_OUTPUT_TERMINAL_SNOOZE_MS = 30 * 60 * 1000;
+// After this many terminal evaluations for the same silent run, escalate to a board approval.
+export const ACTIVE_RUN_OUTPUT_MAX_EVALUATIONS = 3;
 export const STALE_HEARTBEAT_RUN_THRESHOLD_ENV = "PAPERCLIP_STALE_HEARTBEAT_RUN_THRESHOLD_MINUTES";
 export const DEFAULT_STALE_HEARTBEAT_RUN_THRESHOLD_MS = 30 * 60 * 1000;
 const STALE_HEARTBEAT_RUN_ALERT_DEDUPE_MS = 60 * 60 * 1000;
 const ACTIVE_RUN_OUTPUT_EVIDENCE_TAIL_BYTES = 8 * 1024;
+const ACTIVE_RUN_OUTPUT_PROCESS_SNAPSHOT_MAX_CHARS = 4_000;
 const STRANDED_ISSUE_RECOVERY_ORIGIN_KIND = RECOVERY_ORIGIN_KINDS.strandedIssueRecovery;
 const STALE_ACTIVE_RUN_EVALUATION_ORIGIN_KIND = RECOVERY_ORIGIN_KINDS.staleActiveRunEvaluation;
 const STALE_HEARTBEAT_RUN_AGENT_ORIGIN_KIND = RECOVERY_ORIGIN_KINDS.staleHeartbeatRunAgent;
+const RELEASE_STALE_RUN_ORIGIN_KIND = RECOVERY_ORIGIN_KINDS.releaseStaleRun;
 const DEFERRED_WAKE_CONTEXT_KEY = "_paperclipWakeContext";
+const execFile = promisify(execFileCallback);
 
 type RecoveryWakeupOptions = {
   source?: "timer" | "assignment" | "on_demand" | "automation";
@@ -177,6 +190,11 @@ function formatIsoDate(value: Date | string | null | undefined) {
 
 export function readStaleHeartbeatRunThresholdMs(raw = process.env[STALE_HEARTBEAT_RUN_THRESHOLD_ENV]) {
   const minutes = asNumber(raw, DEFAULT_STALE_HEARTBEAT_RUN_THRESHOLD_MS / 60_000);
+  return Math.max(60_000, Math.min(24 * 60 * 60 * 1000, Math.floor(minutes * 60_000)));
+}
+
+export function readActiveRunOutputAlertWindowMs(raw = process.env[ACTIVE_RUN_OUTPUT_ALERT_WINDOW_ENV]) {
+  const minutes = asNumber(raw, DEFAULT_ACTIVE_RUN_OUTPUT_ALERT_WINDOW_MS / 60_000);
   return Math.max(60_000, Math.min(24 * 60 * 60 * 1000, Math.floor(minutes * 60_000)));
 }
 
@@ -631,6 +649,21 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     return row ?? null;
   }
 
+  async function latestActiveOutputDecision(companyId: string, runId: string) {
+    const [row] = await db
+      .select()
+      .from(heartbeatRunWatchdogDecisions)
+      .where(
+        and(
+          eq(heartbeatRunWatchdogDecisions.companyId, companyId),
+          eq(heartbeatRunWatchdogDecisions.runId, runId),
+        ),
+      )
+      .orderBy(desc(heartbeatRunWatchdogDecisions.createdAt))
+      .limit(1);
+    return row ?? null;
+  }
+
   async function findOpenStaleRunEvaluation(companyId: string, runId: string) {
     const [row] = await db
       .select({
@@ -653,6 +686,152 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       )
       .limit(1);
     return row ?? null;
+  }
+
+  async function findRecentTerminalStaleRunEvaluation(companyId: string, runId: string, now: Date) {
+    // Use the anti-dedup cooldown window (60m) to suppress new evaluations after a close.
+    const updatedAfter = new Date(now.getTime() - ACTIVE_RUN_OUTPUT_ANTIDEDUP_COOLDOWN_MS);
+    const [row] = await db
+      .select({
+        id: issues.id,
+        identifier: issues.identifier,
+        status: issues.status,
+        priority: issues.priority,
+        assigneeAgentId: issues.assigneeAgentId,
+        updatedAt: issues.updatedAt,
+      })
+      .from(issues)
+      .where(
+        and(
+          eq(issues.companyId, companyId),
+          eq(issues.originKind, STALE_ACTIVE_RUN_EVALUATION_ORIGIN_KIND),
+          eq(issues.originId, runId),
+          isNull(issues.hiddenAt),
+          inArray(issues.status, ["done", "cancelled"]),
+          gt(issues.updatedAt, updatedAfter),
+        ),
+      )
+      .orderBy(desc(issues.updatedAt))
+      .limit(1);
+    return row ?? null;
+  }
+
+  async function countTerminalStaleRunEvaluations(companyId: string, runId: string) {
+    const [row] = await db
+      .select({ count: sql<number>`count(*)::int` })
+      .from(issues)
+      .where(
+        and(
+          eq(issues.companyId, companyId),
+          eq(issues.originKind, STALE_ACTIVE_RUN_EVALUATION_ORIGIN_KIND),
+          eq(issues.originId, runId),
+          isNull(issues.hiddenAt),
+          inArray(issues.status, ["done", "cancelled"]),
+        ),
+      );
+    return row?.count ?? 0;
+  }
+
+  async function findOpenReleaseStaleRunApproval(companyId: string, runId: string) {
+    const [row] = await db
+      .select({ id: approvals.id, status: approvals.status, payload: approvals.payload })
+      .from(approvals)
+      .where(
+        and(
+          eq(approvals.companyId, companyId),
+          eq(approvals.type, RELEASE_STALE_RUN_ORIGIN_KIND),
+          eq(approvals.status, "pending"),
+          sql`${approvals.payload}->>'runId' = ${runId}`,
+        ),
+      )
+      .orderBy(desc(approvals.createdAt))
+      .limit(1);
+    return row ?? null;
+  }
+
+  async function ensureReleaseStaleRunApproval(input: {
+    run: typeof heartbeatRuns.$inferSelect;
+    runningAgent: typeof agents.$inferSelect;
+    sourceIssue: typeof issues.$inferSelect | null;
+    prefix: string;
+    evaluationCount: number;
+    now: Date;
+  }) {
+    const existing = await findOpenReleaseStaleRunApproval(input.run.companyId, input.run.id);
+    if (existing) return { kind: "existing" as const, approvalId: existing.id };
+
+    const runLink = `/${input.prefix}/agents/${input.runningAgent.id}/runs/${input.run.id}`;
+    const [approval] = await db
+      .insert(approvals)
+      .values({
+        companyId: input.run.companyId,
+        type: RELEASE_STALE_RUN_ORIGIN_KIND,
+        status: "pending",
+        payload: {
+          title: `Force-release or cancel silent run for ${input.runningAgent.name}`,
+          summary: [
+            `Run \`${input.run.id}\` for agent **${input.runningAgent.name}** has been silent for extended periods`,
+            `and generated ${input.evaluationCount} evaluation issue(s) that were all closed without resolving the run.`,
+            `The run remains \`running\` with no output. Board approval is required to force-cancel it.`,
+          ].join(" "),
+          recommendedAction: `POST /api/heartbeat-runs/${input.run.id}/cancel — requires admin-tier permission (§B, pending board approval on [OUT-45618](/OUT/issues/OUT-45618)).`,
+          risks: [
+            "The run may still be producing useful work with output routed elsewhere.",
+            "Cancelling ends the heartbeat run; the source issue may need manual reassignment.",
+          ],
+          runId: input.run.id,
+          agentId: input.runningAgent.id,
+          agentName: input.runningAgent.name,
+          sourceIssueId: input.sourceIssue?.id ?? null,
+          evaluationCount: input.evaluationCount,
+          runLink,
+          detectedAt: input.now.toISOString(),
+        },
+      })
+      .returning();
+
+    if (!approval) throw new Error("Failed to create release_stale_run approval");
+
+    await logActivity(db, {
+      companyId: input.run.companyId,
+      actorType: "system",
+      actorId: "system",
+      agentId: null,
+      runId: input.run.id,
+      action: "heartbeat.stale_run_board_approval_requested",
+      entityType: "heartbeat_run",
+      entityId: input.run.id,
+      details: {
+        source: "recovery.scan_silent_active_runs",
+        approvalId: approval.id,
+        evaluationCount: input.evaluationCount,
+        runId: input.run.id,
+        sourceIssueId: input.sourceIssue?.id ?? null,
+      },
+    });
+
+    return { kind: "created" as const, approvalId: approval.id };
+  }
+
+  function terminalStaleRunEvaluationStillSuppresses(input: {
+    terminal: Awaited<ReturnType<typeof findRecentTerminalStaleRunEvaluation>>;
+    run: typeof heartbeatRuns.$inferSelect;
+    level: "suspicious" | "critical";
+    latestDecision: Awaited<ReturnType<typeof latestActiveOutputDecision>>;
+    now: Date;
+  }) {
+    if (!input.terminal) return false;
+    if (
+      input.latestDecision &&
+      ["snooze", "continue"].includes(input.latestDecision.decision) &&
+      input.latestDecision.snoozedUntil !== null &&
+      input.latestDecision.snoozedUntil <= input.now
+    ) {
+      return false;
+    }
+    if (input.run.lastOutputAt && input.run.lastOutputAt > input.terminal.updatedAt) return false;
+    if (input.level === "critical" && input.terminal.priority !== "high") return false;
+    return true;
   }
 
   async function buildRunOutputSilence(
@@ -719,6 +898,33 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     }
   }
 
+  async function readProcessSnapshotForEvidence(run: typeof heartbeatRuns.$inferSelect) {
+    if (process.platform === "win32") return "";
+    const processGroupId = run.processGroupId;
+    const processPid = run.processPid;
+    if (
+      (typeof processGroupId !== "number" || !Number.isInteger(processGroupId) || processGroupId <= 0) &&
+      (typeof processPid !== "number" || !Number.isInteger(processPid) || processPid <= 0)
+    ) {
+      return "";
+    }
+
+    const args = processGroupId && processGroupId > 0
+      ? ["-o", "pid=,ppid=,pgid=,etime=,stat=,command=", "-g", String(processGroupId)]
+      : ["-o", "pid=,ppid=,pgid=,etime=,stat=,command=", "-p", String(processPid)];
+
+    try {
+      const { stdout } = await execFile("ps", args, {
+        timeout: 2_000,
+        maxBuffer: 64 * 1024,
+      });
+      return stdout.trim();
+    } catch (err) {
+      logger.warn({ err, runId: run.id }, "failed to read stale-run watchdog process snapshot");
+      return "";
+    }
+  }
+
   async function resolveStaleRunSourceIssue(run: typeof heartbeatRuns.$inferSelect) {
     const issueId = issueIdFromRunContext(run.contextSnapshot);
     if (!issueId) return null;
@@ -735,18 +941,21 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     runningAgent: typeof agents.$inferSelect;
     sourceIssue: typeof issues.$inferSelect | null;
   }) {
+    // §A4: Prefer CTO/CEO role candidates first so that domain-IC managers (who lack cancel
+    // permission) are not the primary assignee for silent-run review issues.
     const candidateIds: string[] = [];
-    if (input.sourceIssue?.assigneeAgentId) {
-      const sourceAssignee = await getAgent(input.sourceIssue.assigneeAgentId);
-      if (sourceAssignee?.reportsTo) candidateIds.push(sourceAssignee.reportsTo);
-    }
-    if (input.runningAgent.reportsTo) candidateIds.push(input.runningAgent.reportsTo);
     const roleCandidates = await db
       .select()
       .from(agents)
       .where(and(eq(agents.companyId, input.run.companyId), inArray(agents.role, ["cto", "ceo"])))
       .orderBy(sql`case when ${agents.role} = 'cto' then 0 else 1 end`, asc(agents.createdAt));
     candidateIds.push(...roleCandidates.map((agent) => agent.id));
+    // Fallback: manager of the running agent or source issue assignee.
+    if (input.runningAgent.reportsTo) candidateIds.push(input.runningAgent.reportsTo);
+    if (input.sourceIssue?.assigneeAgentId) {
+      const sourceAssignee = await getAgent(input.sourceIssue.assigneeAgentId);
+      if (sourceAssignee?.reportsTo) candidateIds.push(sourceAssignee.reportsTo);
+    }
 
     const seen = new Set<string>();
     for (const agentId of candidateIds) {
@@ -771,8 +980,9 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     prefix: string;
     now: Date;
   }) {
-    const [tail, recentEvents, childIssues, blockers] = await Promise.all([
+    const [tail, processSnapshot, recentEvents, childIssues, blockers] = await Promise.all([
       readRunLogTailForEvidence(input.run),
+      readProcessSnapshotForEvidence(input.run),
       db
         .select({
           eventType: heartbeatRunEvents.eventType,
@@ -809,9 +1019,14 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     ]);
     const currentUserRedactionOptions = await getCurrentUserRedactionOptions();
     const safeTail = truncateEvidenceText(redactWatchdogEvidenceText(tail, currentUserRedactionOptions));
+    const safeProcessSnapshot = truncateEvidenceText(
+      redactWatchdogEvidenceText(processSnapshot, currentUserRedactionOptions),
+      ACTIVE_RUN_OUTPUT_PROCESS_SNAPSHOT_MAX_CHARS,
+    );
     const silenceAgeMs = silenceAgeMsForRun(input.run, input.now);
     return {
       safeTail,
+      safeProcessSnapshot,
       silenceAgeMs,
       recentEvents: recentEvents.reverse().map((event) => ({
         eventType: event.eventType,
@@ -872,6 +1087,12 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       "",
       input.evidence.safeTail ? `\`\`\`text\n${input.evidence.safeTail}\n\`\`\`` : "_No run-log tail was available._",
       "",
+      "## Host Process Snapshot",
+      "",
+      input.evidence.safeProcessSnapshot
+        ? `\`\`\`text\n${input.evidence.safeProcessSnapshot}\n\`\`\``
+        : "_No host process snapshot was available._",
+      "",
       "## Recent Run Events",
       "",
       recentEvents,
@@ -891,6 +1112,12 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       "- Preserve artifacts, branch state, and useful output before cancellation.",
       "- Cancel or recover through the explicit run recovery controls when authorized.",
       "- Close this issue as a false positive only after recording the reason.",
+      "",
+      "## Recovery Semantics",
+      "",
+      "- If the in-memory handle is present, the active run still owns the child process and reviewers should use run recovery/cancel controls instead of host-level signals.",
+      "- If the in-memory handle is missing but the recorded pid or process group is alive, Paperclip treats the local adapter child as orphaned from server memory; the watchdog assignee owns the review and may terminate that process group after preserving useful evidence.",
+      "- If only descendant processes remain in the recorded process group, the orphan reaper may terminate the group, fail the lost run, and queue the bounded process-loss retry path.",
     ].join("\n");
   }
 
@@ -969,9 +1196,12 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       now: input.now,
     });
     const level = (evidence.silenceAgeMs ?? 0) >= ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS ? "critical" : "suspicious";
+
+    // ── Open-evaluation fast path ─────────────────────────────────────────────
     const existing = await findOpenStaleRunEvaluation(input.run.companyId, input.run.id);
     if (existing) {
       if (level === "critical" && existing.priority !== "high") {
+        // §C2: Priority bump comment is guarded by `existing.priority !== "high"` — happens once.
         await issuesSvc.update(existing.id, {
           priority: "high",
         });
@@ -999,6 +1229,71 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       return { kind: "existing" as const, evaluationIssueId: existing.id };
     }
 
+    // ── §A2: Terminal-churn cap — escalate to board approval after N closures ──
+    // Check this BEFORE the anti-dedup suppression path: once the churn cap is reached, the board
+    // approval path takes priority regardless of whether a recent terminal evaluation exists.
+    const terminalCount = await countTerminalStaleRunEvaluations(input.run.companyId, input.run.id);
+    if (terminalCount >= ACTIVE_RUN_OUTPUT_MAX_EVALUATIONS) {
+      const approval = await ensureReleaseStaleRunApproval({
+        run: input.run,
+        runningAgent,
+        sourceIssue,
+        prefix,
+        evaluationCount: terminalCount,
+        now: input.now,
+      });
+      // Write a long snooze so the scanner does not re-evaluate until the approval resolves.
+      const snoozedUntil = new Date(input.now.getTime() + 24 * 60 * 60 * 1000);
+      await db.insert(heartbeatRunWatchdogDecisions).values({
+        companyId: input.run.companyId,
+        runId: input.run.id,
+        evaluationIssueId: null,
+        decision: "snooze",
+        snoozedUntil,
+        reason: `board approval requested after ${terminalCount} terminal evaluations (approvalId: ${approval.approvalId})`,
+        createdByAgentId: null,
+        createdByUserId: null,
+        createdByRunId: null,
+      });
+      if (sourceIssue && !["done", "cancelled"].includes(sourceIssue.status)) {
+        await issuesSvc.addComment(sourceIssue.id, [
+          `Watchdog escalation: run \`${input.run.id}\` has generated ${terminalCount} evaluation issues that were all closed without resolving the silent run.`,
+          "",
+          `A board approval has been requested to force-release or cancel the run.`,
+          `Until the board acts, the watchdog will not file additional evaluation issues for this run.`,
+        ].join("\n"), { runId: input.run.id });
+      }
+      return {
+        kind: approval.kind === "created" ? "created" as const : "existing" as const,
+        evaluationIssueId: null,
+        approvalId: approval.approvalId,
+      };
+    }
+
+    // ── Terminal-suppression check (§A1, §A3) ─────────────────────────────────
+    const [terminal, latestDecision] = await Promise.all([
+      findRecentTerminalStaleRunEvaluation(input.run.companyId, input.run.id, input.now),
+      latestActiveOutputDecision(input.run.companyId, input.run.id),
+    ]);
+    if (terminalStaleRunEvaluationStillSuppresses({ terminal, run: input.run, level, latestDecision, now: input.now })) {
+      // §A3: Treat a terminal close while the run is still running+silent as an implicit snooze.
+      // Write a watchdog decision row so the scanner skips this run for the cooldown period.
+      const snoozedUntil = new Date(input.now.getTime() + ACTIVE_RUN_OUTPUT_TERMINAL_SNOOZE_MS);
+      await db.insert(heartbeatRunWatchdogDecisions).values({
+        companyId: input.run.companyId,
+        runId: input.run.id,
+        evaluationIssueId: terminal!.id,
+        decision: "snooze",
+        snoozedUntil,
+        reason: `auto-snooze after terminal evaluation ${terminal!.id} closed within anti-dedup cooldown`,
+        createdByAgentId: null,
+        createdByUserId: null,
+        createdByRunId: null,
+      });
+      return { kind: "existing" as const, evaluationIssueId: terminal!.id };
+    }
+
+    // ── Standard path: create or reopen evaluation ────────────────────────────
     const ownerAgentId = await resolveStaleRunOwnerAgentId({ run: input.run, runningAgent, sourceIssue });
     const description = buildStaleRunEvaluationDescription({
       run: input.run,
@@ -1009,10 +1304,42 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       level,
       now: input.now,
     });
+
+    // §C1: Title includes run ID short form + silence duration for dashboard deduplication.
+    const runIdShort = input.run.id.slice(0, 8);
+    const silenceSuffix = evidence.silenceAgeMs != null ? ` — silent ${formatDuration(evidence.silenceAgeMs)}` : "";
+    const evaluationTitle = `Review silent active run for ${runningAgent.name} (${runIdShort})${silenceSuffix}`;
+
+    if (terminal && level === "critical") {
+      await issuesSvc.update(terminal.id, {
+        title: evaluationTitle,
+        description,
+        status: "todo",
+        priority: "high",
+        assigneeAgentId: terminal.assigneeAgentId ?? ownerAgentId,
+      });
+      await issuesSvc.addComment(terminal.id, [
+        "Critical output silence threshold crossed after the previous watchdog alert was closed.",
+        "",
+        `- Run: \`${input.run.id}\``,
+        `- Silent for: ${formatDuration(evidence.silenceAgeMs)}`,
+        `- Last output at: ${input.run.lastOutputAt?.toISOString() ?? "none recorded"}`,
+        `- Anti-dedup cooldown: ${formatDuration(ACTIVE_RUN_OUTPUT_ANTIDEDUP_COOLDOWN_MS)}`,
+        "",
+        "Reopened the existing stale-run alert instead of creating a duplicate.",
+      ].join("\n"), { runId: input.run.id });
+      await ensureSourceIssueBlockedByStaleEvaluation({
+        sourceIssue,
+        evaluationIssue: terminal,
+        run: input.run,
+      });
+      return { kind: "escalated" as const, evaluationIssueId: terminal.id };
+    }
+
     let evaluation: Awaited<ReturnType<typeof issuesSvc.create>>;
     try {
       evaluation = await issuesSvc.create(input.run.companyId, {
-        title: `Review silent active run for ${runningAgent.name}`,
+        title: evaluationTitle,
         description,
         status: "todo",
         priority: level === "critical" ? "high" : "medium",
