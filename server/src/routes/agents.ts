@@ -68,7 +68,7 @@ import {
   refreshAdapterModels,
   requireServerAdapter,
 } from "../adapters/index.js";
-import { redactEventPayload } from "../redaction.js";
+import { redactEventPayload, redactSensitiveText } from "../redaction.js";
 import { redactCurrentUserValue } from "../log-redaction.js";
 import { renderOrgChartSvg, renderOrgChartPng, type OrgNode, type OrgChartStyle, ORG_CHART_STYLES } from "./org-chart-svg.js";
 import { instanceSettingsService } from "../services/instance-settings.js";
@@ -1445,6 +1445,7 @@ export function agentRoutes(
         role: agentsTable.role,
         title: agentsTable.title,
         status: agentsTable.status,
+        pausedAt: agentsTable.pausedAt,
         adapterType: agentsTable.adapterType,
         runtimeConfig: agentsTable.runtimeConfig,
         lastHeartbeatAt: agentsTable.lastHeartbeatAt,
@@ -1461,7 +1462,8 @@ export function agentRoutes(
         const statusEligible =
           row.status !== "paused" &&
           row.status !== "terminated" &&
-          row.status !== "pending_approval";
+          row.status !== "pending_approval" &&
+          row.pausedAt == null;
 
         return {
           id: row.id,
@@ -1473,6 +1475,7 @@ export function agentRoutes(
           role: row.role as InstanceSchedulerHeartbeatAgent["role"],
           title: row.title,
           status: row.status as InstanceSchedulerHeartbeatAgent["status"],
+          pausedAt: row.pausedAt,
           adapterType: row.adapterType,
           intervalSec: policy.intervalSec,
           heartbeatEnabled: policy.enabled,
@@ -1483,7 +1486,8 @@ export function agentRoutes(
       .filter((item) =>
         item.status !== "paused" &&
         item.status !== "terminated" &&
-        item.status !== "pending_approval",
+        item.status !== "pending_approval" &&
+        item.pausedAt == null,
       )
       .sort((left, right) => {
         if (left.schedulerActive !== right.schedulerActive) {
@@ -3048,7 +3052,10 @@ export function agentRoutes(
     });
 
     res.set("Cache-Control", "no-cache, no-store");
-    res.json(result);
+    res.json({
+      ...result,
+      content: typeof result.content === "string" ? redactSensitiveText(result.content) : result.content,
+    });
   });
 
   router.get("/heartbeat-runs/:runId/workspace-operations", async (req, res) => {

@@ -303,7 +303,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         (entry): entry is [string, string] => typeof entry[1] === "string",
       ),
     );
-    const timeoutSec = asNumber(config.timeoutSec, 0);
+    const timeoutSec = asNumber(config.timeoutSec, 1800);
     const graceSec = asNumber(config.graceSec, 20);
     await ensureAdapterExecutionTargetRuntimeCommandInstalled({
       runId,
@@ -544,20 +544,55 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         });
       }
 
-      const proc = await runAdapterExecutionTargetProcess(runId, executionTarget, command, args, {
-        cwd,
-        env: preparedRuntimeConfig.env,
-        stdin: prompt,
-        timeoutSec,
-        graceSec,
-        onSpawn,
-        onLog,
-      });
-      return {
-        proc,
-        rawStderr: proc.stderr,
-        parsed: parseOpenCodeJsonl(proc.stdout),
+      // Silence watchdog: emit a structured warning if the child process produces no
+      // stdout/stderr for graceSec * 20 seconds (300s with default graceSec=15).
+      const silenceWatchdogMs = graceSec * 20 * 1000;
+      let lastOutputAt = Date.now();
+      let spawnedPid: number | null = null;
+      let silenceWarningEmitted = false;
+
+      const watchdogOnLog: typeof onLog = async (stream, chunk) => {
+        lastOutputAt = Date.now();
+        silenceWarningEmitted = false;
+        return onLog(stream, chunk);
       };
+
+      const watchdogOnSpawn: NonNullable<typeof onSpawn> = async (meta) => {
+        spawnedPid = meta.pid;
+        if (onSpawn) await onSpawn(meta);
+      };
+
+      const silenceInterval = setInterval(() => {
+        const silenceSec = (Date.now() - lastOutputAt) / 1000;
+        if (silenceSec >= silenceWatchdogMs / 1000 && !silenceWarningEmitted) {
+          silenceWarningEmitted = true;
+          void onLog(
+            "stdout",
+            `[paperclip] silent_no_output: pid=${spawnedPid ?? "unknown"} no stdout/stderr for ${Math.round(silenceSec)}s (model=${model || "?"}, runId=${runId})\n`,
+          );
+        }
+      }, 30_000).unref();
+
+      await onLog("stdout", `[paperclip] adapter.invoke: start runId=${runId} model=${model || "?"} agent=${agent.id}\n`);
+      try {
+        const proc = await runAdapterExecutionTargetProcess(runId, executionTarget, command, args, {
+          cwd,
+          env: preparedRuntimeConfig.env,
+          stdin: prompt,
+          timeoutSec,
+          graceSec,
+          onSpawn: watchdogOnSpawn,
+          onLog: watchdogOnLog,
+        });
+        await onLog("stdout", `[paperclip] adapter.invoke: end runId=${runId} exitCode=${proc.exitCode ?? -1} timedOut=${proc.timedOut}\n`);
+        return {
+          proc,
+          rawStderr: proc.stderr,
+          parsed: parseOpenCodeJsonl(proc.stdout),
+        };
+      } finally {
+        clearInterval(silenceInterval);
+      }
     };
 
     const toResult = (
