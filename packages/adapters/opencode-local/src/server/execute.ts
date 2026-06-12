@@ -303,7 +303,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         (entry): entry is [string, string] => typeof entry[1] === "string",
       ),
     );
-    const timeoutSec = asNumber(config.timeoutSec, 1800);
+    // Treat timeoutSec=0 as "use the safe default" — 0 disables all killing,
+    // which is how the opencode_local silent-hang (OUT-45785) persisted for >23h.
+    const rawTimeoutSec = asNumber(config.timeoutSec, 0);
+    const timeoutSec = rawTimeoutSec > 0 ? rawTimeoutSec : 1800;
     const graceSec = asNumber(config.graceSec, 20);
     await ensureAdapterExecutionTargetRuntimeCommandInstalled({
       runId,

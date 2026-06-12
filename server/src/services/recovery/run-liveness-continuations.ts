@@ -19,7 +19,7 @@ type IssueRow = Pick<
   typeof issues.$inferSelect,
   "id" | "companyId" | "identifier" | "title" | "status" | "assigneeAgentId" | "executionState" | "projectId"
 >;
-type AgentRow = Pick<typeof agents.$inferSelect, "id" | "companyId" | "status">;
+type AgentRow = Pick<typeof agents.$inferSelect, "id" | "companyId" | "status" | "pausedAt">;
 
 export type RunContinuationDecision =
   | {
@@ -123,6 +123,9 @@ export function decideRunLivenessContinuation(input: {
   }
   if (!CONTINUATION_AGENT_STATUSES.has(agent.status)) {
     return { kind: "skip", reason: `agent status ${agent.status} is not invokable` };
+  }
+  if (agent.pausedAt != null) {
+    return { kind: "skip", reason: "agent has pausedAt set; skipping liveness continuation until unpaused" };
   }
   if (budgetBlocked) {
     return { kind: "skip", reason: "budget hard stop blocks continuation" };

@@ -3971,6 +3971,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           id: agents.id,
           companyId: agents.companyId,
           status: agents.status,
+          pausedAt: agents.pausedAt,
         })
         .from(agents)
         .where(eq(agents.id, run.agentId))
@@ -4621,7 +4622,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       };
     }
 
-    if (agent.status === "paused" || agent.status === "terminated" || agent.status === "pending_approval") {
+    if (agent.status === "paused" || agent.status === "terminated" || agent.status === "pending_approval" || agent.pausedAt != null) {
       return {
         allowed: false,
         reason: "Scheduled retry suppressed because the agent is not invokable",
@@ -4630,6 +4631,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         details: {
           agentId: agent.id,
           agentStatus: agent.status,
+          agentPausedAt: agent.pausedAt,
         },
       };
     }
@@ -6204,8 +6206,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       let retriedRun: typeof heartbeatRuns.$inferSelect | null = null;
       if (shouldRetry) {
         const agent = await getAgent(run.agentId);
-        if (agent) {
+        // Do not retry if the agent has pausedAt set — OUT-45785.
+        // (Agents with status="paused" but no pausedAt still get a queued retry
+        //  so it executes once the agent is unpaused.)
+        if (agent && agent.pausedAt == null) {
           retriedRun = await enqueueProcessLossRetry(finalizedRun, agent, now);
+        } else if (agent) {
+          // Agent has pausedAt set; release the issue lock without retrying.
+          // releaseIssueExecutionAndPromote also guards on pausedAt and will
+          // skip automatic recovery for this agent.
+          await releaseIssueExecutionAndPromote(finalizedRun);
         }
       } else {
         await releaseIssueExecutionAndPromote(finalizedRun);
@@ -6364,7 +6374,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return withAgentStartLock(agentId, async () => {
       const agent = await getAgent(agentId);
       if (!agent) return [];
-      if (agent.status === "paused" || agent.status === "terminated" || agent.status === "pending_approval") {
+      if (agent.status === "paused" || agent.status === "terminated" || agent.status === "pending_approval" || agent.pausedAt != null) {
         return [];
       }
       const policy = parseHeartbeatPolicy(agent);
@@ -7802,7 +7812,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       recoveryAgent &&
       recoveryAgent.status !== "paused" &&
       recoveryAgent.status !== "terminated" &&
-      recoveryAgent.status !== "pending_approval";
+      recoveryAgent.status !== "pending_approval" &&
+      recoveryAgent.pausedAt == null;  // OUT-45785: pausedAt set means effectively paused
     const recoverySessionBefore = recoveryAgentInvokable
       ? await resolveSessionBeforeForWakeup(recoveryAgent, taskKey)
       : null;
@@ -8056,6 +8067,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         (run.status === "failed" || run.status === "timed_out" || run.status === "cancelled");
 
       if (!issueNeedsImmediateRecovery) {
+        return { kind: "released" as const };
+      }
+
+      // OUT-45785: if the recovery agent is paused (pausedAt set), skip automatic
+      // immediate recovery — the issue will wait until the agent is unpaused.
+      if (recoveryAgent?.pausedAt != null) {
         return { kind: "released" as const };
       }
 

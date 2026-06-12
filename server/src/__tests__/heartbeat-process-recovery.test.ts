@@ -386,10 +386,15 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
   async function seedRunFixture(input?: {
     adapterType?: string;
     agentStatus?: "paused" | "idle" | "running";
+    agentPausedAt?: Date | null;
     runStatus?: "running" | "queued" | "failed";
     processPid?: number | null;
     processGroupId?: number | null;
     processLossRetryCount?: number;
+    lastOutputAt?: Date | null;
+    lastOutputSeq?: number;
+    lastOutputStream?: "stdout" | "stderr" | null;
+    lastOutputBytes?: number | null;
     includeIssue?: boolean;
     runErrorCode?: string | null;
     runError?: string | null;
@@ -415,6 +420,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       name: "CodexCoder",
       role: "engineer",
       status: input?.agentStatus ?? "paused",
+      pausedAt: input?.agentPausedAt !== undefined ? input.agentPausedAt : null,
       adapterType: input?.adapterType ?? "codex_local",
       adapterConfig: {},
       runtimeConfig: {},
@@ -446,6 +452,10 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       processPid: input?.processPid ?? null,
       processGroupId: input?.processGroupId ?? null,
       processLossRetryCount: input?.processLossRetryCount ?? 0,
+      lastOutputAt: input?.lastOutputAt ?? null,
+      lastOutputSeq: input?.lastOutputSeq ?? 0,
+      lastOutputStream: input?.lastOutputStream ?? null,
+      lastOutputBytes: input?.lastOutputBytes ?? null,
       errorCode: input?.runErrorCode ?? null,
       error: input?.runError ?? null,
       startedAt: now,
@@ -904,17 +914,31 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     const failedRun = runs.find((row) => row.id === runId);
     const retryRun = runs.find((row) => row.id !== runId);
     expect(failedRun?.status).toBe("failed");
-    expect(failedRun?.errorCode).toBe("process_lost");
+    expect(failedRun?.errorCode).toBe("process_lost_child_pid_exit");
     expect(failedRun?.livenessState).toBe("failed");
-    expect(failedRun?.livenessReason).toContain("process_lost");
+    expect(failedRun?.livenessReason).toContain("process_lost_child_pid_exit");
     expect(failedRun?.resultJson).toMatchObject({
       stopReason: "process_lost",
+      processLoss: {
+        subcode: "process_lost_child_pid_exit",
+        adapterType: "codex_local",
+        processPid: 999_999_999,
+        retryCount: 0,
+        retryDisposition: "safe_retry_queued",
+        serverRestartCorrelated: false,
+      },
       timeoutConfigured: false,
       timeoutFired: false,
     });
     expect(retryRun?.status).toBe("queued");
     expect(retryRun?.retryOfRunId).toBe(runId);
     expect(retryRun?.processLossRetryCount).toBe(1);
+    expect(retryRun?.contextSnapshot).toMatchObject({
+      processLossRecovery: {
+        subcode: "process_lost_child_pid_exit",
+        processPid: 999_999_999,
+      },
+    });
 
     const issue = await db
       .select()
@@ -923,6 +947,38 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       .then((rows) => rows[0] ?? null);
     expect(issue?.executionRunId).toBe(retryRun?.id ?? null);
     expect(issue?.checkoutRunId).toBe(runId);
+  });
+
+  it("classifies process loss without child evidence as a server restart correlation", async () => {
+    const { runId } = await seedRunFixture({
+      includeIssue: false,
+      processPid: null,
+      processGroupId: null,
+      lastOutputAt: new Date("2026-03-19T00:00:10.000Z"),
+      lastOutputSeq: 7,
+      lastOutputStream: "stderr",
+      lastOutputBytes: 1024,
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reapOrphanedRuns();
+    expect(result.reaped).toBe(1);
+    expect(result.runIds).toEqual([runId]);
+
+    const failedRun = await heartbeat.getRun(runId);
+    expect(failedRun?.errorCode).toBe("process_lost_server_restart");
+    expect(failedRun?.resultJson).toMatchObject({
+      stopReason: "process_lost",
+      processLoss: {
+        subcode: "process_lost_server_restart",
+        serverRestartCorrelated: true,
+        retryDisposition: "no_retry_needs_infra_investigation",
+        lastOutputAt: "2026-03-19T00:00:10.000Z",
+        lastOutputSeq: 7,
+        lastOutputStream: "stderr",
+        lastOutputBytes: 1024,
+      },
+    });
   });
 
   it("releases active environment leases when an orphaned run is reaped", async () => {
@@ -974,8 +1030,15 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
 
     const failedRun = runs.find((row) => row.id === runId);
     expect(failedRun?.status).toBe("failed");
-    expect(failedRun?.errorCode).toBe("process_lost");
+    expect(failedRun?.errorCode).toBe("process_lost_child_pid_exit");
     expect(failedRun?.error).toContain("descendant process group");
+    expect(failedRun?.resultJson).toMatchObject({
+      stopReason: "process_lost",
+      processLoss: {
+        subcode: "process_lost_child_pid_exit",
+        descendantOnlyCleanup: true,
+      },
+    });
 
     const retryRun = runs.find((row) => row.id !== runId);
     expect(retryRun?.status).toBe("queued");
@@ -1024,7 +1087,18 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       .from(heartbeatRuns)
       .where(eq(heartbeatRuns.agentId, agentId));
     expect(runs).toHaveLength(2);
-    expect(runs.find((row) => row.id === runId)?.status).toBe("failed");
+    const failedRun = runs.find((row) => row.id === runId);
+    expect(failedRun?.status).toBe("failed");
+    expect(failedRun?.errorCode).toBe("process_lost_retry_exhausted");
+    expect(failedRun?.resultJson).toMatchObject({
+      stopReason: "process_lost",
+      processLoss: {
+        subcode: "process_lost_retry_exhausted",
+        processPid: 999_999_999,
+        retryCount: 1,
+        retryDisposition: "retry_already_attempted_needs_infra_investigation",
+      },
+    });
     const continuationRun = runs.find((row) => row.id !== runId);
     expect(continuationRun?.contextSnapshot as Record<string, unknown> | undefined).toMatchObject({
       retryReason: "issue_continuation_needed",
@@ -2357,5 +2431,75 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
 
     const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
     expect(runs).toHaveLength(1);
+  });
+
+  /**
+   * Regression test for OUT-45785: process_lost_retry must NOT spawn a new run
+   * when the agent has pausedAt set (even if status is "idle" or "running").
+   * Before the fix, the enqueueProcessLossRetry call site did not consult pausedAt,
+   * so killed processes were retried indefinitely for paused agents.
+   */
+  it("does NOT enqueue a process_lost_retry run when the agent has pausedAt set", async () => {
+    const agentPausedAt = new Date("2026-06-11T13:14:55.968Z");
+    const { agentId, runId, issueId } = await seedRunFixture({
+      agentStatus: "running",
+      agentPausedAt,
+      processPid: 999_999_999,     // non-existent PID — will be reaped as orphan
+      processLossRetryCount: 0,
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reapOrphanedRuns();
+    expect(result.reaped).toBe(1);
+
+    // Allow any in-flight async transitions to settle
+    await waitForHeartbeatIdle(db, 3_000);
+
+    const runs = await db
+      .select({ id: heartbeatRuns.id, status: heartbeatRuns.status, retryOfRunId: heartbeatRuns.retryOfRunId })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, agentId));
+
+    // The original run must be failed. Critically: no run should have retryOfRunId pointing
+    // to the original run — that would indicate the pausedAt guard was bypassed.
+    const originalRun = runs.find((row) => row.id === runId);
+    expect(originalRun?.status).toBe("failed");
+    const retryRun = runs.find((row) => row.retryOfRunId === runId);
+    expect(retryRun).toBeUndefined();
+
+    // The issue execution lock should have been released (not held by the dead run).
+    const issue = await db
+      .select({ executionRunId: issues.executionRunId })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
+    expect(issue?.executionRunId).toBeNull();
+  });
+
+  it("still enqueues a process_lost_retry run when the agent has pausedAt=null and status is active", async () => {
+    const { agentId, runId } = await seedRunFixture({
+      agentStatus: "idle",
+      agentPausedAt: null,
+      processPid: 999_999_999,
+      processLossRetryCount: 0,
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reapOrphanedRuns();
+    expect(result.reaped).toBe(1);
+
+    // The retry run may immediately advance past "queued" → "running" via the mock adapter.
+    // Wait briefly so the run state is settled.
+    await waitForHeartbeatIdle(db, 3_000);
+
+    const runs = await db
+      .select({ id: heartbeatRuns.id, status: heartbeatRuns.status, retryOfRunId: heartbeatRuns.retryOfRunId })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, agentId));
+
+    // Should have 2 runs: original (failed) + retry (any terminal or active state)
+    expect(runs).toHaveLength(2);
+    const retryRun = runs.find((row) => row.retryOfRunId === runId);
+    expect(retryRun).toBeDefined();
   });
 });
