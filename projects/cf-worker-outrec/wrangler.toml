@@ -1,0 +1,42 @@
+name = "outrec-hazard-api"
+main = "src/index.js"
+compatibility_date = "2026-05-01"
+account_id = "3001f62a464eedb24fcae1fdff650e6d"
+workers_dev = false
+
+kv_namespaces = [
+  { binding = "OUTREC_KV", id = "e359b14ec3134984b2bc02cac0ade845", preview_id = "e359b14ec3134984b2bc02cac0ade845" }
+]
+
+routes = [
+  { pattern = "ai.outrec.com/api/outrec/*", zone_name = "outrec.com" },
+  { pattern = "ai.outrec.com/api/analytics/*", zone_name = "outrec.com" },
+  { pattern = "ai.outrec.com/api/reliability/*", zone_name = "outrec.com" },
+  { pattern = "ai.outrec.com/api/chat/*", zone_name = "outrec.com" },
+  { pattern = "ai.outrec.com/api/cro/*", zone_name = "outrec.com" },
+  { pattern = "ai.outrec.com/api/brand-trust/*", zone_name = "outrec.com" },
+  { pattern = "ai.outrec.com/dashboard/api/brand-trust/*", zone_name = "outrec.com" },
+  { pattern = "ai.outrec.com/api/seo/*", zone_name = "outrec.com" },
+  { pattern = "ai.outrec.com/api/inventory/*", zone_name = "outrec.com" },
+  { pattern = "ai.outrec.com/api/routes/presets", zone_name = "outrec.com" },
+  { pattern = "ai.outrec.com/api/preset-routes/*", zone_name = "outrec.com" },
+  { pattern = "ai.outrec.com/api/admin/preset-route-feedback/export", zone_name = "outrec.com" },
+  { pattern = "ai.outrec.com/api/admin/preset-route-feedback/capture-metrics", zone_name = "outrec.com" },
+  { pattern = "ai.outrec.com/dashboard/api/dp360/inventory/*", zone_name = "outrec.com" },
+  { pattern = "ai.outrec.com/api/hazards/report", zone_name = "outrec.com" },
+  { pattern = "ai.outrec.com/api/group-ride/*", zone_name = "outrec.com" }
+]
+
+[[d1_databases]]
+binding = "OUTREC_AUTH_DB"
+database_name = "outrec_auth"
+database_id = "71cd88cb-b42f-4619-b091-eb95552d1a4d"
+migrations_dir = "migrations"
+
+[[durable_objects.bindings]]
+name = "GROUP_RIDE_ROOM"
+class_name = "GroupRideRoom"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["GroupRideRoom"]
