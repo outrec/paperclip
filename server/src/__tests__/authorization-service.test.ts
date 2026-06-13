@@ -892,6 +892,86 @@ describeEmbeddedPostgres("authorization service", () => {
     expect(denied.allowed).toBe(false);
   });
 
+  it("allows a direct manager to mutate a report's issue via the reporting chain", async () => {
+    const company = await createCompany(db, "IssueMutateManagerChain");
+    const managerAgent = await createAgent(db, company.id, { role: "manager" });
+    const reportAgent = await createAgent(db, company.id, { reportsTo: managerAgent.id });
+    const issue = await createIssue(db, company.id, {
+      title: "Report's issue",
+      assigneeAgentId: reportAgent.id,
+    });
+
+    const decision = await authorizationService(db).decide({
+      actor: { type: "agent", agentId: managerAgent.id, companyId: company.id, source: "agent_key" },
+      action: "issue:mutate",
+      resource: {
+        type: "issue",
+        companyId: company.id,
+        issueId: issue.id,
+        assigneeAgentId: reportAgent.id,
+      },
+    });
+
+    expect(decision).toMatchObject({
+      allowed: true,
+      reason: "allow_manager_chain",
+    });
+  });
+
+  it("allows a transitive manager to mutate a downstream report's issue", async () => {
+    const company = await createCompany(db, "IssueMutateTransitiveChain");
+    const ceoAgent = await createAgent(db, company.id, { role: "ceo" });
+    const directorAgent = await createAgent(db, company.id, { reportsTo: ceoAgent.id });
+    const managerAgent = await createAgent(db, company.id, { reportsTo: directorAgent.id });
+    const reportAgent = await createAgent(db, company.id, { reportsTo: managerAgent.id });
+    const issue = await createIssue(db, company.id, {
+      title: "Grand-report's issue",
+      assigneeAgentId: reportAgent.id,
+    });
+
+    const decision = await authorizationService(db).decide({
+      actor: { type: "agent", agentId: ceoAgent.id, companyId: company.id, source: "agent_key" },
+      action: "issue:mutate",
+      resource: {
+        type: "issue",
+        companyId: company.id,
+        issueId: issue.id,
+        assigneeAgentId: reportAgent.id,
+      },
+    });
+
+    expect(decision).toMatchObject({
+      allowed: true,
+      reason: "allow_manager_chain",
+    });
+  });
+
+  it("still denies issue:mutate when the actor is not in the assignee's reporting chain", async () => {
+    const company = await createCompany(db, "IssueMutateUnrelatedAgent");
+    const unrelatedAgent = await createAgent(db, company.id, { role: "engineer" });
+    const assigneeAgent = await createAgent(db, company.id, { role: "engineer" });
+    const issue = await createIssue(db, company.id, {
+      title: "Peer's issue",
+      assigneeAgentId: assigneeAgent.id,
+    });
+
+    const decision = await authorizationService(db).decide({
+      actor: { type: "agent", agentId: unrelatedAgent.id, companyId: company.id, source: "agent_key" },
+      action: "issue:mutate",
+      resource: {
+        type: "issue",
+        companyId: company.id,
+        issueId: issue.id,
+        assigneeAgentId: assigneeAgent.id,
+      },
+    });
+
+    expect(decision).toMatchObject({
+      allowed: false,
+      reason: "deny_missing_grant",
+    });
+  });
+
   it("preserves unscoped tasks:assign compatibility for assignment decisions", async () => {
     const company = await createCompany(db, "BroadAssign");
     const actorAgent = await createAgent(db, company.id);
