@@ -853,6 +853,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       resultJson: mergedResultJson,
       summary: parsedStream.summary || asString(parsed.result, ""),
       clearSession: clearSessionForMaxTurns || Boolean(opts.clearSessionOnMissingSession && !resolvedSessionId),
+      toolCallRecords: parsedStream.toolCallRecords.length > 0 ? parsedStream.toolCallRecords : undefined,
     };
   };
 

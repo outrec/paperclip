@@ -1,4 +1,4 @@
-import type { UsageSummary } from "@paperclipai/adapter-utils";
+import type { UsageSummary, ToolCallRecord } from "@paperclipai/adapter-utils";
 import {
   asString,
   asNumber,
@@ -20,6 +20,10 @@ export function parseClaudeStreamJson(stdout: string) {
   let finalResult: Record<string, unknown> | null = null;
   const assistantTexts: string[] = [];
 
+  // Pending tool calls keyed by tool_use_id, waiting to be matched with results
+  const pendingToolCalls = new Map<string, { toolName: string; startedAt: Date }>();
+  const toolCallRecords: ToolCallRecord[] = [];
+
   for (const rawLine of stdout.split(/\r?\n/)) {
     const line = rawLine.trim();
     if (!line) continue;
@@ -40,9 +44,57 @@ export function parseClaudeStreamJson(stdout: string) {
       for (const entry of content) {
         if (typeof entry !== "object" || entry === null || Array.isArray(entry)) continue;
         const block = entry as Record<string, unknown>;
-        if (asString(block.type, "") === "text") {
+        const blockType = asString(block.type, "");
+        if (blockType === "text") {
           const text = asString(block.text, "");
           if (text) assistantTexts.push(text);
+        } else if (blockType === "tool_use") {
+          const toolUseId = asString(block.id, "");
+          const toolName = asString(block.name, "unknown");
+          if (toolUseId) {
+            pendingToolCalls.set(toolUseId, { toolName, startedAt: new Date() });
+          }
+        }
+      }
+      continue;
+    }
+
+    if (type === "user") {
+      const message = parseObject(event.message);
+      const content = Array.isArray(message.content) ? message.content : [];
+      for (const entry of content) {
+        if (typeof entry !== "object" || entry === null || Array.isArray(entry)) continue;
+        const block = entry as Record<string, unknown>;
+        if (asString(block.type, "") === "tool_result") {
+          const toolUseId = asString(block.tool_use_id, "");
+          const isError = block.is_error === true;
+          const pending = toolUseId ? pendingToolCalls.get(toolUseId) : undefined;
+          if (pending) {
+            const now = new Date();
+            const durationMs = now.getTime() - pending.startedAt.getTime();
+            let errorMessage: string | null = null;
+            if (isError) {
+              if (typeof block.content === "string") {
+                errorMessage = block.content.slice(0, 500) || null;
+              } else if (Array.isArray(block.content)) {
+                const parts: string[] = [];
+                for (const part of block.content) {
+                  if (typeof part === "object" && part !== null && typeof (part as Record<string, unknown>).text === "string") {
+                    parts.push((part as Record<string, unknown>).text as string);
+                  }
+                }
+                errorMessage = parts.join("\n").slice(0, 500) || null;
+              }
+            }
+            toolCallRecords.push({
+              toolName: pending.toolName,
+              toolUseId,
+              outcome: isError ? "error" : "success",
+              durationMs,
+              errorMessage,
+            });
+            pendingToolCalls.delete(toolUseId);
+          }
         }
       }
       continue;
@@ -54,6 +106,17 @@ export function parseClaudeStreamJson(stdout: string) {
     }
   }
 
+  // Any tool calls still pending at end of stream (timed out or no result received) → mark as timeout
+  for (const [toolUseId, pending] of pendingToolCalls) {
+    toolCallRecords.push({
+      toolName: pending.toolName,
+      toolUseId,
+      outcome: "timeout",
+      durationMs: null,
+      errorMessage: null,
+    });
+  }
+
   if (!finalResult) {
     return {
       sessionId,
@@ -62,6 +125,7 @@ export function parseClaudeStreamJson(stdout: string) {
       usage: null as UsageSummary | null,
       summary: assistantTexts.join("\n\n").trim(),
       resultJson: null as Record<string, unknown> | null,
+      toolCallRecords,
     };
   }
 
@@ -82,6 +146,7 @@ export function parseClaudeStreamJson(stdout: string) {
     usage,
     summary,
     resultJson: finalResult,
+    toolCallRecords,
   };
 }
 

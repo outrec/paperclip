@@ -37,6 +37,7 @@ import {
   issueWorkProducts,
   projects,
   projectWorkspaces,
+  toolCalls,
   workspaceOperations,
 } from "@paperclipai/db";
 import { conflict, HttpError, notFound } from "../errors.js";
@@ -7538,6 +7539,25 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         }),
         adapterResult.summary ?? null,
       );
+
+      // Persist per-tool-call records for KPI-2 (tool-failure rate)
+      if (adapterResult.toolCallRecords && adapterResult.toolCallRecords.length > 0) {
+        try {
+          await db.insert(toolCalls).values(
+            adapterResult.toolCallRecords.map((record) => ({
+              companyId: run.companyId,
+              runId: run.id,
+              agentId: run.agentId,
+              toolName: record.toolName,
+              outcome: record.outcome,
+              durationMs: record.durationMs ?? null,
+              errorMessage: record.errorMessage ?? null,
+            })),
+          );
+        } catch (err) {
+          logger.warn({ companyId: run.companyId, runId: run.id, err }, "Failed to persist tool_calls rows");
+        }
+      }
 
       let persistedRun = await setRunStatus(run.id, status, {
         finishedAt: new Date(),

@@ -66,6 +66,14 @@ export interface AdapterRuntimeServiceReport {
 
 export type AdapterExecutionErrorFamily = "transient_upstream";
 
+export interface ToolCallRecord {
+  toolName: string;
+  toolUseId: string;
+  outcome: "success" | "error" | "timeout";
+  durationMs: number | null;
+  errorMessage: string | null;
+}
+
 export interface AdapterExecutionResult {
   exitCode: number | null;
   signal: string | null;
@@ -91,6 +99,7 @@ export interface AdapterExecutionResult {
   runtimeServices?: AdapterRuntimeServiceReport[];
   summary?: string | null;
   clearSession?: boolean;
+  toolCallRecords?: ToolCallRecord[];
   question?: {
     prompt: string;
     choices: Array<{
