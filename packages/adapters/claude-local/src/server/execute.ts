@@ -857,6 +857,18 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     };
   };
 
+  const emitRateLimitedTelemetry = async (result: AdapterExecutionResult) => {
+    if (result.errorFamily === "transient_upstream" && result.retryNotBefore) {
+      const telemetryPayload = JSON.stringify({
+        event: "adapter.claude_local.rate_limited",
+        resetAt: result.retryNotBefore,
+        agentId: agent.id,
+        runId,
+      });
+      await onLog("stdout", `[paperclip:telemetry] ${telemetryPayload}\n`);
+    }
+  };
+
   try {
     const initial = await runAttempt(sessionId ?? null);
     if (
@@ -874,7 +886,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       return toAdapterResult(retry, { fallbackSessionId: null, clearSessionOnMissingSession: true });
     }
 
-    return toAdapterResult(initial, { fallbackSessionId: runtimeSessionId || runtime.sessionId });
+    const result = toAdapterResult(initial, { fallbackSessionId: runtimeSessionId || runtime.sessionId });
+    await emitRateLimitedTelemetry(result);
+    return result;
   } finally {
     if (paperclipBridge) {
       await paperclipBridge.stop();

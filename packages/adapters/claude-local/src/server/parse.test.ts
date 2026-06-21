@@ -21,6 +21,23 @@ describe("isClaudeTransientUpstreamError", () => {
     ).toBe(true);
   });
 
+  it("classifies 'You've hit your limit' as transient (OUT-49658)", () => {
+    expect(
+      isClaudeTransientUpstreamError({
+        errorMessage: "You've hit your limit · resets 9:40pm (America/Chicago)",
+      }),
+    ).toBe(true);
+    expect(
+      isClaudeTransientUpstreamError({
+        parsed: {
+          is_error: true,
+          subtype: "success",
+          result: "You've hit your limit · resets 9:40pm (America/Chicago)",
+        },
+      }),
+    ).toBe(true);
+  });
+
   it("classifies Anthropic API rate_limit_error and overloaded_error as transient", () => {
     expect(
       isClaudeTransientUpstreamError({
@@ -104,6 +121,32 @@ describe("extractClaudeRetryNotBefore", () => {
       now,
     );
     expect(extracted?.toISOString()).toBe("2026-04-22T21:00:00.000Z");
+  });
+
+  it("parses reset time from 'You've hit your limit' variant (OUT-49658)", () => {
+    const now = new Date("2026-04-22T15:15:00.000Z");
+    const extracted = extractClaudeRetryNotBefore(
+      { errorMessage: "You've hit your limit · resets 9:40pm (America/Chicago)" },
+      now,
+    );
+    // 9:40pm America/Chicago (CDT = UTC-5) → 02:40 UTC next day is wrong;
+    // CDT is UTC-5, so 9:40pm CDT = 02:40 UTC (next calendar day)
+    expect(extracted?.toISOString()).toBe("2026-04-23T02:40:00.000Z");
+  });
+
+  it("parses reset time from structured result 'You've hit your limit' variant (OUT-49658)", () => {
+    const now = new Date("2026-04-22T15:15:00.000Z");
+    const extracted = extractClaudeRetryNotBefore(
+      {
+        parsed: {
+          is_error: true,
+          subtype: "success",
+          result: "You've hit your limit · resets 9:40pm (America/Chicago)",
+        },
+      },
+      now,
+    );
+    expect(extracted?.toISOString()).toBe("2026-04-23T02:40:00.000Z");
   });
 
   it("rolls forward past midnight when the reset time has already passed today", () => {
