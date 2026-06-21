@@ -18,6 +18,7 @@ const PRESET_ROUTE_FEEDBACK_METRIC_PREFIX = "preset_route_feedback_metric:";
 const RELIABILITY_EVENT_PREFIX = "reliability_event:";
 const CRO_EXPERIMENT_EVENT_PREFIX = "cro_experiment_event:";
 const CRO_EXPERIMENT_EVENTS_TABLE = "cro_experiment_events";
+const VERIFICATION_CODE_TTL_MS = 15 * 60 * 1000;
 const GROUP_RIDE_CREATE_SUCCESS_LIMIT = 5;
 const GROUP_RIDE_CREATE_ATTEMPT_LIMIT = 20;
 const GROUP_RIDE_CREATE_RATE_TTL_SECONDS = 10 * 60;
@@ -423,6 +424,18 @@ export async function handleRequest(request, env, options = {}) {
       return await refreshAuthSession(request, env, kv, authDb, now);
     }
 
+    if (request.method === "POST" && apiPath === "/auth/verify/email") {
+      return await verifyEmail(request, authDb, now);
+    }
+
+    if (request.method === "POST" && apiPath === "/auth/verify/phone") {
+      return await verifyPhone(request, authDb, now);
+    }
+
+    if (request.method === "POST" && apiPath === "/auth/verification/resend") {
+      return await resendVerification(request, kv, authDb, now);
+    }
+
     if (request.method === "POST" && apiPath === "/auth/signout") {
       return await signout(request, env, kv, authDb, now);
     }
@@ -492,7 +505,169 @@ async function signup(request, kv, db, now) {
   };
 
   await insertAccount(db, account);
+
+  // Generate and store verification codes for email and phone
+  const expiresAt = iso(now + VERIFICATION_CODE_TTL_MS);
+  const emailCode = generateVerificationCode();
+  const phoneCode = generateVerificationCode();
+  const [emailCodeHash, phoneCodeHash] = await Promise.all([sha256Hex(emailCode), sha256Hex(phoneCode)]);
+  await insertVerification(db, accountId, "email", emailCodeHash, account.email, expiresAt, now);
+  await insertVerification(db, accountId, "phone", phoneCodeHash, account.phone, expiresAt, now);
+  // Log codes so they are accessible in Cloudflare Worker logs for QA/dev.
+  // Production: wire up email/SMS sending here using env bindings.
+  console.log("verification_codes_created", { accountId, emailCode, phoneCode });
+
   return json(accountProgress(account, deviceId), 201);
+}
+
+async function verifyEmail(request, db, now) {
+  const body = await readJson(request);
+  const accountId = normalizeText(body.accountId);
+  const code = normalizeText(body.code);
+  if (!accountId) return json({ error: "bad_request", message: "accountId is required" }, 400);
+  if (!code) return json({ error: "bad_request", message: "code is required" }, 400);
+
+  const account = await findAccountById(db, safeId(accountId));
+  if (!account) return json({ error: "account_not_found" }, 404);
+  if (account.emailVerifiedAt) return json({ error: "verification_already_complete" }, 422);
+
+  const verification = await findPendingVerification(db, account.id, "email", now);
+  if (!verification) return json({ error: "invalid_verification_code" }, 422);
+
+  const codeHash = await sha256Hex(code);
+  if (codeHash !== verification.tokenHash) return json({ error: "invalid_verification_code" }, 422);
+
+  const verifiedAt = iso(now);
+  await consumeVerification(db, verification.id, verifiedAt);
+  await markEmailVerified(db, account.id, verifiedAt);
+  account.emailVerifiedAt = verifiedAt;
+  account.updatedAt = verifiedAt;
+  console.log("email_verified", { accountId: account.id });
+  return json(accountProgress(account, null));
+}
+
+async function verifyPhone(request, db, now) {
+  const body = await readJson(request);
+  const accountId = normalizeText(body.accountId);
+  const code = normalizeText(body.code);
+  if (!accountId) return json({ error: "bad_request", message: "accountId is required" }, 400);
+  if (!code) return json({ error: "bad_request", message: "code is required" }, 400);
+
+  const account = await findAccountById(db, safeId(accountId));
+  if (!account) return json({ error: "account_not_found" }, 404);
+  if (account.phoneVerifiedAt) return json({ error: "verification_already_complete" }, 422);
+
+  const verification = await findPendingVerification(db, account.id, "phone", now);
+  if (!verification) return json({ error: "invalid_verification_code" }, 422);
+
+  const codeHash = await sha256Hex(code);
+  if (codeHash !== verification.tokenHash) return json({ error: "invalid_verification_code" }, 422);
+
+  const verifiedAt = iso(now);
+  await consumeVerification(db, verification.id, verifiedAt);
+  await markPhoneVerified(db, account.id, verifiedAt);
+  account.phoneVerifiedAt = verifiedAt;
+  account.updatedAt = verifiedAt;
+  console.log("phone_verified", { accountId: account.id });
+  return json(accountProgress(account, null));
+}
+
+async function resendVerification(request, kv, db, now) {
+  const body = await readJson(request);
+  const email = normalizeEmail(body.email);
+  const password = normalizeText(body.password);
+  const channel = normalizeText(body.channel);
+
+  if (!email || !password) return json({ error: "invalid_credentials" }, 401);
+  if (channel !== "email" && channel !== "phone") {
+    return json({ error: "bad_request", message: "channel must be email or phone" }, 400);
+  }
+
+  const account = await findAccountByEmail(db, email);
+  if (!account || account.passwordHash !== (await passwordHash(password))) {
+    return json({ error: "invalid_credentials" }, 401);
+  }
+
+  const alreadyVerified = channel === "email" ? account.emailVerifiedAt : account.phoneVerifiedAt;
+  if (alreadyVerified) return json({ error: "verification_already_complete" }, 422);
+
+  const rlKey = `resend:${account.id}:${channel}:${minuteBucket(now)}`;
+  const rate = await checkRateLimit(kv, rlKey, 3, 60 * 60);
+  if (!rate.allowed) return json({ error: "rate_limited", retryAfterSeconds: rate.retryAfterSeconds }, 429);
+
+  const code = generateVerificationCode();
+  const codeHash = await sha256Hex(code);
+  const target = channel === "email" ? account.email : account.phone;
+  const expiresAt = iso(now + VERIFICATION_CODE_TTL_MS);
+  await insertVerification(db, account.id, channel, codeHash, target, expiresAt, now);
+  // Log code for QA/dev. Production: wire up email/SMS sending here using env bindings.
+  console.log("verification_code_resent", { accountId: account.id, channel, code, target });
+
+  return json(accountProgress(account, null));
+}
+
+function generateVerificationCode() {
+  const bytes = new Uint8Array(3);
+  crypto.getRandomValues(bytes);
+  return String(100000 + ((bytes[0] << 16 | bytes[1] << 8 | bytes[2]) % 900000));
+}
+
+async function insertVerification(db, accountId, kind, tokenHash, target, expiresAt, now) {
+  const id = randomId();
+  await dbRun(
+    db,
+    `INSERT INTO account_verifications (id, account_id, kind, token_hash, target, expires_at, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    id,
+    accountId,
+    kind,
+    tokenHash,
+    target,
+    expiresAt,
+    iso(now)
+  );
+  return id;
+}
+
+async function findPendingVerification(db, accountId, kind, now) {
+  const row = await dbFirst(
+    db,
+    `SELECT * FROM account_verifications
+     WHERE account_id = ? AND kind = ? AND consumed_at IS NULL AND expires_at > ?
+     ORDER BY created_at DESC LIMIT 1`,
+    accountId,
+    kind,
+    iso(now)
+  );
+  return row ? { id: row.id, tokenHash: row.token_hash, expiresAt: row.expires_at } : null;
+}
+
+async function consumeVerification(db, id, consumedAt) {
+  await dbRun(db, "UPDATE account_verifications SET consumed_at = ? WHERE id = ?", consumedAt, id);
+}
+
+async function markEmailVerified(db, accountId, verifiedAt) {
+  await dbRun(
+    db,
+    `UPDATE accounts SET email_verified_at = ?,
+     status = CASE WHEN phone_verified_at IS NOT NULL AND vin_verified_at IS NOT NULL THEN 'active' ELSE status END,
+     updated_at = ? WHERE id = ?`,
+    verifiedAt,
+    verifiedAt,
+    accountId
+  );
+}
+
+async function markPhoneVerified(db, accountId, verifiedAt) {
+  await dbRun(
+    db,
+    `UPDATE accounts SET phone_verified_at = ?,
+     status = CASE WHEN email_verified_at IS NOT NULL AND vin_verified_at IS NOT NULL THEN 'active' ELSE status END,
+     updated_at = ? WHERE id = ?`,
+    verifiedAt,
+    verifiedAt,
+    accountId
+  );
 }
 
 function configuredCroExperimentId(env) {

@@ -40,3 +40,7 @@ class_name = "GroupRideRoom"
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["GroupRideRoom"]
+
+[[migrations]]
+tag = "v2"
+new_classes = []
