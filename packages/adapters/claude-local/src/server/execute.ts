@@ -795,7 +795,12 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       : null;
     const clearSessionForMaxTurns = isClaudeMaxTurnsResult(parsed);
     const parsedIsError = asBoolean(parsed.is_error, false);
-    const failed = (proc.exitCode ?? 0) !== 0 || parsedIsError;
+    const parsedSubtype = asString(parsed.subtype, "").trim().toLowerCase();
+    // subtype=success with is_error=false is an authoritative SDK success signal.
+    // Trust it over the process exit code: the CLI may exit non-zero for cleanup
+    // reasons after a semantically successful run (OUT-50012).
+    // When is_error=true the usage-limit pattern (OUT-49658) must still propagate.
+    const failed = parsedIsError || (parsedSubtype !== "success" && (proc.exitCode ?? 0) !== 0);
     const errorMessage = failed
       ? describeClaudeFailure(parsed) ?? `Claude exited with code ${proc.exitCode ?? -1}`
       : null;
