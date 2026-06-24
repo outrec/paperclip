@@ -163,4 +163,45 @@ describe("extractClaudeRetryNotBefore", () => {
       extractClaudeRetryNotBefore({ errorMessage: "Overloaded. Try again later." }, new Date()),
     ).toBeNull();
   });
+
+  it("parses date+time format 'resets Jun 27, 9pm (America/Chicago)'", () => {
+    // now = June 23, 2026 at 15:00 UTC (before Jun 27)
+    const now = new Date("2026-06-23T15:00:00.000Z");
+    const extracted = extractClaudeRetryNotBefore(
+      { errorMessage: "You've hit your limit · resets Jun 27, 9pm (America/Chicago)" },
+      now,
+    );
+    // Jun 27 9pm CDT (UTC-5) = Jun 28 02:00 UTC
+    expect(extracted?.toISOString()).toBe("2026-06-28T02:00:00.000Z");
+  });
+
+  it("parses date+time format with explicit minutes 'resets Jun 27, 9:00 pm (America/Chicago)'", () => {
+    const now = new Date("2026-06-23T15:00:00.000Z");
+    const extracted = extractClaudeRetryNotBefore(
+      { errorMessage: "You've hit your limit · resets Jun 27, 9:00 pm (America/Chicago)" },
+      now,
+    );
+    // Jun 27 9pm CDT (UTC-5) = Jun 28 02:00 UTC
+    expect(extracted?.toISOString()).toBe("2026-06-28T02:00:00.000Z");
+  });
+
+  it("rolls to next year when the date+time reset is already in the past", () => {
+    // Simulate: it's currently July 5, 2026 — "Jun 27" is already past
+    const now = new Date("2026-07-05T15:00:00.000Z");
+    const extracted = extractClaudeRetryNotBefore(
+      { errorMessage: "You've hit your limit · resets Jun 27, 9pm (America/Chicago)" },
+      now,
+    );
+    // Jun 27, 2027 9pm CDT (UTC-5) = Jun 28, 2027 02:00 UTC
+    expect(extracted?.toISOString()).toBe("2027-06-28T02:00:00.000Z");
+  });
+
+  it("still parses time-only 'resets at 9 p.m.' after date+time support added", () => {
+    const now = new Date("2026-04-22T15:15:00.000Z");
+    const extracted = extractClaudeRetryNotBefore(
+      { errorMessage: "You're out of extra usage · resets 4pm (America/Chicago)" },
+      now,
+    );
+    expect(extracted?.toISOString()).toBe("2026-04-22T21:00:00.000Z");
+  });
 });

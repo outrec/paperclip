@@ -386,8 +386,51 @@ function nextClockTimeInTimeZone(input: {
   return retryAt;
 }
 
+const MONTH_NAMES_SHORT = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"];
+
+function parseClaudeResetDateTime(text: string, now: Date, timeZoneHint?: string | null): Date | null {
+  // Handles formats like "Jun 27, 9pm" or "Jun 27, 9:30 pm" or "June 27, 9:00 pm"
+  const match = text.match(/^([A-Za-z]+)\s+(\d{1,2}),\s+(\d{1,2})(?::(\d{2}))?\s*([ap])\.?\s*m\.?/i);
+  if (!match) return null;
+
+  const monthStr = (match[1] ?? "").toLowerCase().slice(0, 3);
+  const monthIndex = MONTH_NAMES_SHORT.indexOf(monthStr);
+  if (monthIndex === -1) return null;
+
+  const month = monthIndex + 1;
+  const day = Number.parseInt(match[2] ?? "", 10);
+  const hour12 = Number.parseInt(match[3] ?? "", 10);
+  const minute = Number.parseInt(match[4] ?? "0", 10);
+
+  if (!Number.isInteger(day) || day < 1 || day > 31) return null;
+  if (!Number.isInteger(hour12) || hour12 < 1 || hour12 > 12) return null;
+  if (!Number.isInteger(minute) || minute < 0 || minute > 59) return null;
+
+  let hour24 = hour12 % 12;
+  if ((match[5] ?? "").toLowerCase() === "p") hour24 += 12;
+
+  const timeZone = normalizeResetTimeZone(timeZoneHint) ?? "UTC";
+  const nowYear = readTimeZoneParts(now, timeZone).year;
+
+  // Try current year first, then next year if the date is already in the past
+  for (const year of [nowYear, nowYear + 1]) {
+    const candidate = dateFromTimeZoneWallClock({ year, month, day, hour: hour24, minute, timeZone });
+    if (candidate && candidate.getTime() > now.getTime()) {
+      return candidate;
+    }
+  }
+
+  return null;
+}
+
 function parseClaudeResetClockTime(clockText: string, now: Date, timeZoneHint?: string | null): Date | null {
   const normalized = clockText.trim().replace(/\s+/g, " ");
+
+  // Try date+time format first (e.g., "Jun 27, 9pm (America/Chicago)")
+  const dateTimeResult = parseClaudeResetDateTime(normalized, now, timeZoneHint);
+  if (dateTimeResult) return dateTimeResult;
+
+  // Fall back to time-only format (e.g., "9 p.m.", "5:30 a.m.")
   const match = normalized.match(/^(\d{1,2})(?::(\d{2}))?\s*([ap])\.?\s*m\.?/i);
   if (!match) return null;
 
