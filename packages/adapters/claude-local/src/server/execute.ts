@@ -54,6 +54,12 @@ import { prepareClaudeConfigSeed } from "./claude-config.js";
 import { resolveClaudeDesiredSkillNames } from "./skills.js";
 import { isBedrockModelId } from "./models.js";
 import { prepareClaudePromptBundle } from "./prompt-cache.js";
+import {
+  readClaudeOAuthCredentials,
+  writeClaudeOAuthAccessToken,
+  refreshClaudeAccessTokenWithRetry,
+  OAuthRefreshUnavailableError,
+} from "./quota.js";
 
 const __moduleDir = path.dirname(fileURLToPath(import.meta.url));
 
@@ -873,6 +879,61 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       await onLog("stdout", `[paperclip:telemetry] ${telemetryPayload}\n`);
     }
   };
+
+  // ---------------------------------------------------------------------------
+  // Pre-execution: refresh expired Claude OAuth access token in-process.
+  // This avoids stranding runs when the Anthropic OAuth refresh endpoint has a
+  // transient blip (see OUT-50598).  We only do this for subscription billing
+  // (non-Bedrock, non-API-key) since those are the only runs that use OAuth tokens.
+  // ---------------------------------------------------------------------------
+  if (billingType === "subscription" && !isBedrockAuth(effectiveEnv)) {
+    const oauthCreds = await readClaudeOAuthCredentials();
+    const nowMs = Date.now();
+    // Treat the token as needing refresh if expiresAt is known and within 5 min of expiry.
+    const tokenExpiredOrExpiring =
+      oauthCreds !== null &&
+      oauthCreds.refreshToken !== null &&
+      oauthCreds.expiresAt !== null &&
+      oauthCreds.expiresAt - nowMs < 5 * 60 * 1000;
+    if (tokenExpiredOrExpiring && oauthCreds !== null && oauthCreds.refreshToken !== null) {
+      await onLog(
+        "stdout",
+        `[paperclip] Claude OAuth access token expired (expiresAt=${new Date(oauthCreds.expiresAt!).toISOString()}); attempting in-process refresh.\n`,
+      );
+      try {
+        const refreshed = await refreshClaudeAccessTokenWithRetry(oauthCreds.refreshToken, { onLog });
+        await writeClaudeOAuthAccessToken(
+          oauthCreds.credPath,
+          refreshed.accessToken,
+          refreshed.expiresAt,
+          refreshed.refreshToken ?? undefined,
+        );
+        await onLog(
+          "stdout",
+          `[paperclip] Claude OAuth token refreshed successfully; proceeding with run.\n`,
+        );
+      } catch (err) {
+        if (err instanceof OAuthRefreshUnavailableError) {
+          const msg = `Claude OAuth token refresh unavailable after ${err.attempts} attempt(s): ${err.message}`;
+          await onLog("stderr", `[paperclip] ${msg}\n`);
+          return {
+            timedOut: false,
+            errorMessage: msg,
+            errorCode: "oauth_refresh_unavailable",
+            errorFamily: "transient_upstream",
+            retryNotBefore: null,
+            resultJson: {
+              errorCode: "oauth_refresh_unavailable",
+              oauthRefreshAttempts: err.attempts,
+            },
+          };
+        }
+        // Unexpected error — log and continue; let the claude process surface the auth error
+        const errMsg = err instanceof Error ? err.message : String(err);
+        await onLog("stderr", `[paperclip] OAuth token refresh failed unexpectedly: ${errMsg}; proceeding with run.\n`);
+      }
+    }
+  }
 
   try {
     const initial = await runAttempt(sessionId ?? null);

@@ -85,7 +85,33 @@ function trimToLatestUsagePanel(text: string): string | null {
   return tail;
 }
 
-async function readClaudeTokenFromFile(credPath: string): Promise<string | null> {
+// ---------------------------------------------------------------------------
+// OAuth credentials — read, refresh, and write back
+// ---------------------------------------------------------------------------
+
+/** Exponential backoff delays (ms) for Anthropic OAuth refresh endpoint failures.
+ *  Total maximum delay: 2 + 5 + 15 + 45 = 67 s (well under the 90 s budget). */
+export const CLAUDE_OAUTH_REFRESH_BACKOFF_MS = [2_000, 5_000, 15_000, 45_000] as const;
+
+/** Anthropic Claude.ai OAuth token endpoint used for refresh-token exchanges. */
+export const ANTHROPIC_OAUTH_TOKEN_URL = "https://auth.anthropic.com/oauth2/token";
+
+export interface ClaudeOAuthCredentials {
+  accessToken: string;
+  refreshToken: string | null;
+  /** Unix epoch milliseconds (undefined means unknown / never expires in our store). */
+  expiresAt: number | null;
+  /** Path of the credentials file this was read from (for writes). */
+  credPath: string;
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function readClaudeCredentialsFile(
+  credPath: string,
+): Promise<{ raw: string; obj: Record<string, unknown> } | null> {
   let raw: string;
   try {
     raw = await fs.readFile(credPath, "utf8");
@@ -99,11 +125,220 @@ async function readClaudeTokenFromFile(credPath: string): Promise<string | null>
     return null;
   }
   if (typeof parsed !== "object" || parsed === null) return null;
-  const obj = parsed as Record<string, unknown>;
-  const oauth = obj["claudeAiOauth"];
+  return { raw, obj: parsed as Record<string, unknown> };
+}
+
+async function readClaudeTokenFromFile(credPath: string): Promise<string | null> {
+  const result = await readClaudeCredentialsFile(credPath);
+  if (!result) return null;
+  const oauth = result.obj["claudeAiOauth"];
   if (typeof oauth !== "object" || oauth === null) return null;
   const token = (oauth as Record<string, unknown>)["accessToken"];
   return typeof token === "string" && token.length > 0 ? token : null;
+}
+
+/** Reads the full OAuth credentials block including refresh token and expiry.
+ *  Returns null when no valid credentials file is found. */
+export async function readClaudeOAuthCredentials(): Promise<ClaudeOAuthCredentials | null> {
+  const configDir = claudeConfigDir();
+  for (const filename of [".credentials.json", "credentials.json"]) {
+    const credPath = path.join(configDir, filename);
+    const result = await readClaudeCredentialsFile(credPath);
+    if (!result) continue;
+    const oauth = result.obj["claudeAiOauth"];
+    if (typeof oauth !== "object" || oauth === null) continue;
+    const oauthObj = oauth as Record<string, unknown>;
+    const accessToken = typeof oauthObj["accessToken"] === "string" && oauthObj["accessToken"].trim().length > 0
+      ? oauthObj["accessToken"].trim()
+      : null;
+    if (!accessToken) continue;
+    const refreshToken = typeof oauthObj["refreshToken"] === "string" && oauthObj["refreshToken"].trim().length > 0
+      ? oauthObj["refreshToken"].trim()
+      : null;
+    const rawExpiry = oauthObj["expiresAt"];
+    const expiresAt = typeof rawExpiry === "number" && Number.isFinite(rawExpiry) ? rawExpiry : null;
+    return { accessToken, refreshToken, expiresAt, credPath };
+  }
+  return null;
+}
+
+/** Writes the refreshed access token (and optional new expiry/refresh) back to
+ *  the credentials file, preserving all other fields. */
+export async function writeClaudeOAuthAccessToken(
+  credPath: string,
+  newAccessToken: string,
+  newExpiresAt: number | null,
+  newRefreshToken?: string | null,
+): Promise<void> {
+  const result = await readClaudeCredentialsFile(credPath);
+  if (!result) {
+    throw new Error(`Cannot update credentials: file not readable at ${credPath}`);
+  }
+  const obj = result.obj;
+  const existingOauth =
+    typeof obj["claudeAiOauth"] === "object" && obj["claudeAiOauth"] !== null
+      ? (obj["claudeAiOauth"] as Record<string, unknown>)
+      : {};
+  obj["claudeAiOauth"] = {
+    ...existingOauth,
+    accessToken: newAccessToken,
+    ...(newExpiresAt !== null ? { expiresAt: newExpiresAt } : {}),
+    ...(newRefreshToken !== undefined && newRefreshToken !== null ? { refreshToken: newRefreshToken } : {}),
+  };
+  await fs.writeFile(credPath, JSON.stringify(obj, null, 2), "utf8");
+}
+
+/** Return value from a successful Anthropic OAuth token refresh. */
+export interface OAuthRefreshResult {
+  accessToken: string;
+  refreshToken: string | null;
+  expiresAt: number | null;
+}
+
+/** Error thrown when the OAuth refresh endpoint returns a terminal failure (not retriable). */
+export class OAuthRefreshTerminalError extends Error {
+  constructor(
+    public readonly status: number,
+    message: string,
+  ) {
+    super(message);
+    this.name = "OAuthRefreshTerminalError";
+  }
+}
+
+/** Error thrown when the OAuth refresh endpoint returns a transient 401/429 that exhausted all retries. */
+export class OAuthRefreshUnavailableError extends Error {
+  constructor(
+    public readonly attempts: number,
+    message: string,
+  ) {
+    super(message);
+    this.name = "OAuthRefreshUnavailableError";
+  }
+}
+
+interface OAuthRefreshOptions {
+  /** Override the token endpoint URL (useful for tests). */
+  tokenUrl?: string;
+  /** Override the backoff schedule in ms. */
+  backoffMs?: readonly number[];
+  /** Structured log callback — called on each attempt. */
+  onLog?: (stream: "stdout" | "stderr", chunk: string) => Promise<void>;
+}
+
+/** Calls the Anthropic OAuth token refresh endpoint once and returns the new tokens.
+ *  Throws OAuthRefreshTerminalError for non-retriable failures, or re-throws the
+ *  raw error for unexpected network errors. */
+export async function refreshClaudeAccessToken(
+  refreshToken: string,
+  options?: Pick<OAuthRefreshOptions, "tokenUrl">,
+): Promise<OAuthRefreshResult> {
+  const tokenUrl = options?.tokenUrl ?? ANTHROPIC_OAUTH_TOKEN_URL;
+  const body = new URLSearchParams();
+  body.set("grant_type", "refresh_token");
+  body.set("refresh_token", refreshToken);
+
+  const resp = await fetchWithTimeout(
+    tokenUrl,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: body.toString(),
+    },
+    15_000,
+  );
+
+  if (!resp.ok) {
+    throw new OAuthRefreshTerminalError(
+      resp.status,
+      `Anthropic OAuth refresh returned ${resp.status}`,
+    );
+  }
+
+  const json = (await resp.json()) as Record<string, unknown>;
+  const accessToken = typeof json["access_token"] === "string" ? json["access_token"] : null;
+  if (!accessToken) {
+    throw new OAuthRefreshTerminalError(0, "Anthropic OAuth refresh response missing access_token");
+  }
+  const newRefreshToken = typeof json["refresh_token"] === "string" ? json["refresh_token"] : null;
+  const expiresIn = typeof json["expires_in"] === "number" ? json["expires_in"] : null;
+  const expiresAt = expiresIn !== null ? Date.now() + expiresIn * 1000 : null;
+
+  return { accessToken, refreshToken: newRefreshToken, expiresAt };
+}
+
+/** Retries `refreshClaudeAccessToken` with exponential backoff on transient 401/429 responses.
+ *  Emits a structured log line on each attempt.
+ *  Throws `OAuthRefreshUnavailableError` if all retries are exhausted. */
+export async function refreshClaudeAccessTokenWithRetry(
+  refreshToken: string,
+  opts: OAuthRefreshOptions = {},
+): Promise<OAuthRefreshResult> {
+  const backoff = opts.backoffMs ?? CLAUDE_OAUTH_REFRESH_BACKOFF_MS;
+  const onLog = opts.onLog ?? (async () => {});
+  const tokenUrl = opts.tokenUrl ?? ANTHROPIC_OAUTH_TOKEN_URL;
+
+  let lastStatus: number | null = null;
+
+  for (let attempt = 0; attempt <= backoff.length; attempt++) {
+    const isRetry = attempt > 0;
+    await onLog(
+      "stdout",
+      JSON.stringify({
+        event: "adapter.claude_local.oauth_refresh_attempt",
+        attempt: attempt + 1,
+        maxAttempts: backoff.length + 1,
+        isRetry,
+      }) + "\n",
+    );
+
+    try {
+      const result = await refreshClaudeAccessToken(refreshToken, { tokenUrl });
+      await onLog(
+        "stdout",
+        JSON.stringify({
+          event: "adapter.claude_local.oauth_refresh_success",
+          attempt: attempt + 1,
+        }) + "\n",
+      );
+      return result;
+    } catch (err) {
+      if (err instanceof OAuthRefreshTerminalError) {
+        lastStatus = err.status;
+        const isTransient = err.status === 401 || err.status === 429;
+        await onLog(
+          "stdout",
+          JSON.stringify({
+            event: "adapter.claude_local.oauth_refresh_failed",
+            attempt: attempt + 1,
+            status: err.status,
+            isTransient,
+            message: err.message,
+          }) + "\n",
+        );
+        if (!isTransient || attempt >= backoff.length) break;
+        const delayMs = backoff[attempt]!;
+        await onLog(
+          "stdout",
+          JSON.stringify({
+            event: "adapter.claude_local.oauth_refresh_backoff",
+            attempt: attempt + 1,
+            delayMs,
+          }) + "\n",
+        );
+        await sleep(delayMs);
+        continue;
+      }
+      // Non-terminal error (network, timeout) — propagate immediately
+      throw err;
+    }
+  }
+
+  throw new OAuthRefreshUnavailableError(
+    backoff.length + 1,
+    `Anthropic OAuth refresh endpoint unavailable after ${backoff.length + 1} attempt(s)` +
+      (lastStatus !== null ? ` (last HTTP status: ${lastStatus})` : ""),
+  );
 }
 
 interface ClaudeAuthStatus {
