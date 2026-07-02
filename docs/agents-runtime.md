@@ -39,7 +39,8 @@ Built-in adapters:
 - `opencode_local`: runs your local `opencode` CLI
 - `cursor`: runs Cursor in background mode
 - `pi_local`: runs an embedded Pi agent locally
-- `hermes_local`: runs your local `hermes` CLI (`hermes-paperclip-adapter`)
+- `hermes_local`: starts your local `hermes` CLI through `@paperclipai/hermes-paperclip-adapter`
+- `hermes_gateway`: calls an already-running Hermes API server through `@paperclipai/hermes-paperclip-adapter/gateway`
 - `openclaw_gateway`: connects to an OpenClaw gateway endpoint
 - `process`: generic shell command adapter
 - `http`: calls an external HTTP endpoint
@@ -48,7 +49,7 @@ External plugin adapters (install via the adapter manager or API):
 
 - `droid_local`: runs your local Factory Droid CLI (`@henkey/droid-paperclip-adapter`)
 
-For local CLI adapters (`claude_local`, `codex_local`, `opencode_local`, `hermes_local`, `droid_local`), Paperclip assumes the CLI is already installed and authenticated on the host machine.
+For local CLI adapters (`claude_local`, `codex_local`, `opencode_local`, `hermes_local`, `droid_local`), Paperclip assumes the CLI is already installed and authenticated on the host machine. For `hermes_gateway`, Paperclip assumes the Hermes API server is already running, reachable from the Paperclip server, and configured with an API key. The older `@paperclipai/adapter-hermes-gateway` npm package is only a deprecated compatibility shim; the adapter type remains `hermes_gateway`.
 
 ## 3.2 Runtime behavior
 
@@ -175,9 +176,79 @@ That means:
 
 Start with least privilege where possible, and avoid exposing secrets in broad reusable prompts unless intentionally required.
 
-## 10. Minimal setup checklist
+## 10. Team-scoped session reset
 
-1. Choose adapter (e.g. `claude_local`, `codex_local`, `opencode_local`, `hermes_local`, `cursor`, or `openclaw_gateway`). External plugins like `droid_local` are also available via the adapter manager.
+When an agent gets stuck — rate-limited, zero-token, or looping silently — a same-team peer or manager can clear the session without needing a CEO/board relay.
+
+### Endpoint
+
+```
+POST /api/agents/{agentId}/sessions/reset
+Authorization: Bearer <agent-api-key>
+Content-Type: application/json
+
+{
+  "reason": "Agent appears stuck after rate-limit window",
+  "clearIssueLock": true,
+  "issueId": "<uuid-of-the-stuck-issue>"
+}
+```
+
+### Who can call it
+
+- **Same-team agent** — caller must share the same `reportsTo` as the target agent (peer), or the caller must be the direct manager of the target agent.
+- **Board/admin** — always accepted (same as the legacy board-only reset endpoint).
+- Rate limit: 20 calls per minute per calling agent.
+
+### What it does
+
+1. Deletes the persisted `agentTaskSessions` rows for the target agent, forcing a fresh session on the next heartbeat.
+2. Clears the `agentRuntimeState.sessionId` and `lastError` fields.
+3. When `clearIssueLock: true` and `issueId` is provided, nulls out `executionRunId` and `executionLockedAt` on that issue, releasing any stale checkout lock.
+4. Emits an `agent.session.reset` audit event with actor, target, reason, and team context.
+
+### Response
+
+| Scenario | HTTP | Body |
+|---|---|---|
+| Reset performed | 200 | `{ status: "reset", agentId, issueLockCleared, issueId, sessionState }` |
+| Session already gone (idempotent) | 200 | `{ status: "no_session" }` |
+| Caller not same team | 403 | `{ error: "Forbidden: ..." }` |
+| Rate limit exceeded | 429 | `{ error: "Rate limit exceeded", retryAfterSeconds }` |
+
+### When to use this
+
+Use `sessions/reset` when:
+
+- An agent stopped producing output after a Claude rate-limit window and is not self-recovering after a full minute.
+- A heartbeat ended with a zero-token / empty run and subsequent wakes are also silent.
+- An issue has a stale `executionLockedAt` from a previous run that crashed before releasing the lock, and the issue is stuck in a loop.
+
+**Do not use `sessions/reset` when:**
+
+- The adapter has a **misconfigured API key** — clearing the session will not fix the credential error; the next run will fail identically.
+- The adapter code has a **bug** (wrong `cwd`, missing dependency, syntax error in the prompt template) — you need to fix the root cause first.
+- The agent is **paused** — unpause it instead.
+- The issue was intentionally checked out by another agent and is actively running — verify before clearing the lock.
+
+### End-to-end scenario
+
+1. CSO's productivity-review agent detects peer agent `X` has been silent for 10+ minutes on issue `OUT-99999`.
+2. Productivity-review agent calls:
+   ```
+   POST /api/agents/<X-agent-id>/sessions/reset
+   { "reason": "Silent for 10 min post rate-limit", "clearIssueLock": true, "issueId": "<OUT-99999-uuid>" }
+   ```
+3. Paperclip returns `{ status: "reset", issueLockCleared: true }`.
+4. Agent `X`'s next scheduled wakeup starts with a fresh session and a cleared checkout lock.
+
+### Legacy board-only endpoint
+
+The existing `POST /api/agents/{agentId}/runtime-state/reset-session` (board/admin only, accepts `taskKey`) remains available for board-driven resets and admin scripting. The new `sessions/reset` endpoint is the preferred path for agent-to-agent team recovery.
+
+## 11. Minimal setup checklist
+
+1. Choose adapter (e.g. `claude_local`, `codex_local`, `opencode_local`, `hermes_local`, `hermes_gateway`, `cursor`, or `openclaw_gateway`). External plugins like `droid_local` are also available via the adapter manager.
 2. Set `cwd` to the target workspace (for local adapters).
 3. Optionally add a prompt template (`promptTemplate`) or use the managed instructions bundle.
 4. Configure heartbeat policy (timer and/or assignment wakeups).

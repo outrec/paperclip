@@ -1,13 +1,16 @@
 export {
+  instanceSettingsSchema,
   instanceGeneralSettingsSchema,
   patchInstanceGeneralSettingsSchema,
   type InstanceGeneralSettings,
   type PatchInstanceGeneralSettings,
   instanceExperimentalSettingsSchema,
   patchInstanceExperimentalSettingsSchema,
+  patchInstanceSettingsSchema,
   issueGraphLivenessAutoRecoveryRequestSchema,
   type InstanceExperimentalSettings,
   type PatchInstanceExperimentalSettings,
+  type PatchInstanceSettings,
   type IssueGraphLivenessAutoRecoveryRequest,
 } from "./instance.js";
 
@@ -39,6 +42,24 @@ export {
   type ProbeEnvironmentConfig,
 } from "./environment.js";
 export {
+  environmentCustomImageTemplateKindSchema,
+  environmentCustomImageTemplateStatusSchema,
+  environmentCustomImageSetupSessionStatusSchema,
+  environmentCustomImageSetupConnectionTypeSchema,
+  environmentCustomImageSetupConnectionSummarySchema,
+  environmentCustomImageTemplateSchema,
+  environmentCustomImageSetupSessionSchema,
+  startEnvironmentCustomImageSetupSessionSchema,
+  finishEnvironmentCustomImageSetupSessionSchema,
+  cancelEnvironmentCustomImageSetupSessionSchema,
+  type EnvironmentCustomImageSetupConnectionSummary,
+  type EnvironmentCustomImageTemplate,
+  type EnvironmentCustomImageSetupSession,
+  type StartEnvironmentCustomImageSetupSession,
+  type FinishEnvironmentCustomImageSetupSession,
+  type CancelEnvironmentCustomImageSetupSession,
+} from "./environment-custom-images.js";
+export {
   feedbackDataSharingPreferenceSchema,
   feedbackTargetTypeSchema,
   feedbackTraceStatusSchema,
@@ -56,6 +77,22 @@ export {
   updateResourceMembershipSchema,
   type UpdateResourceMembership,
 } from "./resource-memberships.js";
+
+export {
+  externalObjectStatusCategorySchema,
+  externalObjectStatusToneSchema,
+  externalObjectLivenessStateSchema,
+  externalObjectMentionSourceKindSchema,
+  externalObjectMentionConfidenceSchema,
+  externalObjectProviderKeySchema,
+  externalObjectTypeSchema,
+  externalObjectCanonicalIdentitySchema,
+  externalObjectMentionSourceSchema,
+  type ExternalObjectCanonicalIdentityInput,
+  type ExternalObjectMentionSourceInput,
+  type ExternalObjectProviderKeyInput,
+  type ExternalObjectTypeInput,
+} from "./external-object.js";
 export {
   companySkillSourceTypeSchema,
   companySkillTrustLevelSchema,
@@ -188,10 +225,16 @@ export {
   updateAgentInstructionsBundleSchema,
   upsertAgentInstructionsFileSchema,
   updateAgentInstructionsPathSchema,
+  agentApiKeyScopeSchema,
+  normalizeAgentApiKeyScope,
+  standardAgentKeyScopeSchema,
+  taskBridgeAgentKeyScopeSchema,
   createAgentKeySchema,
   agentMineInboxQuerySchema,
   wakeAgentSchema,
   resetAgentSessionSchema,
+  agentSessionResetSchema,
+  type AgentSessionReset,
   testAdapterEnvironmentSchema,
   agentPermissionsSchema,
   updateAgentPermissionsSchema,
@@ -201,6 +244,8 @@ export {
   type UpdateAgentInstructionsBundle,
   type UpsertAgentInstructionsFile,
   type UpdateAgentInstructionsPath,
+  type AgentApiKeyScope,
+  type TaskBridgeAgentKeyScope,
   type CreateAgentKey,
   type AgentMineInboxQuery,
   type WakeAgent,
@@ -295,6 +340,7 @@ export {
   issueDocumentKeySchema,
   upsertIssueDocumentSchema,
   restoreIssueDocumentRevisionSchema,
+  upsertIssueWatchdogSchema,
   type CreateIssue,
   type CreateChildIssue,
   type CreateAcceptedPlanDecomposition,
@@ -315,6 +361,7 @@ export {
   type IssueDocumentFormat,
   type UpsertIssueDocument,
   type RestoreIssueDocumentRevision,
+  type UpsertIssueWatchdog,
 } from "./issue.js";
 
 export {
@@ -368,6 +415,7 @@ export {
 export {
   executionWorkspaceConfigSchema,
   updateExecutionWorkspaceSchema,
+  workspaceOverviewQuerySchema,
   executionWorkspaceStatusSchema,
   executionWorkspaceCloseActionKindSchema,
   executionWorkspaceCloseActionSchema,
@@ -376,6 +424,7 @@ export {
   executionWorkspaceCloseReadinessSchema,
   executionWorkspaceCloseReadinessStateSchema,
   type UpdateExecutionWorkspace,
+  type WorkspaceOverviewQuery,
 } from "./execution-workspace.js";
 
 export {
@@ -482,6 +531,27 @@ export {
   createAssetImageMetadataSchema,
   type CreateAssetImageMetadata,
 } from "./asset.js";
+
+export {
+  pipelineAutomationRetryCleanupOptionsSchema,
+  pipelineAutomationRetryRequestSchema,
+  pipelineAutomationRetryScopeSchema,
+  pipelineStageAutomationSchema,
+  pipelineStageApproverSchema,
+  pipelineStageConfigSchema,
+  pipelineStageKindSchema,
+  pipelineStageOnEnterSchema,
+  pipelineStageVariableSchema,
+  type PipelineAutomationRetryCleanupOptions,
+  type PipelineAutomationRetryRequest,
+  type PipelineAutomationRetryScope,
+  type PipelineStageAutomationConfig,
+  type PipelineStageApprover,
+  type PipelineStageConfig,
+  type PipelineStageKind,
+  type PipelineStageOnEnter,
+  type PipelineStageVariable,
+} from "./pipeline.js";
 
 export {
   createCompanyInviteSchema,
